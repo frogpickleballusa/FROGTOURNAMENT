@@ -1,4 +1,30 @@
 import { useState, useMemo, useRef, useEffect } from "react";
+import { db } from "./firebase";
+import { doc, setDoc, onSnapshot, deleteDoc } from "firebase/firestore";
+
+function makeLiveCode(){
+  const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid ambiguity
+  let s="";
+  for(let i=0;i<6;i++)s+=chars[Math.floor(Math.random()*chars.length)];
+  return s;
+}
+
+// Firestore rejects arrays nested directly inside other arrays (this app's schedules are
+// exactly that: rounds is an array of matches-arrays). These wrap/unwrap a directly-nested
+// array as {__arr:[...]} on the way out and back, leaving the app's own state shape alone.
+function fsSanitize(value){
+  if(Array.isArray(value))return value.map(v=>{const sv=fsSanitize(v);return Array.isArray(sv)?{__arr:sv}:sv;});
+  if(value&&typeof value==="object"){const out={};for(const k in value)out[k]=fsSanitize(value[k]);return out;}
+  return value;
+}
+function fsUnsanitize(value){
+  if(Array.isArray(value))return value.map(fsUnsanitize);
+  if(value&&typeof value==="object"){
+    if("__arr"in value&&Object.keys(value).length===1)return fsUnsanitize(value.__arr);
+    const out={};for(const k in value)out[k]=fsUnsanitize(value[k]);return out;
+  }
+  return value;
+}
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
 const C = {
@@ -55,65 +81,222 @@ function extractPinnedPairs(players){
   return{pinnedPairs,free};
 }
 
-// Circle-method: generates all unique rounds for a list of slots
-function circleMethodRounds(slots){
-  const arr=slots.length%2===0?[...slots]:[...slots,null];
-  const n=arr.length,half=n/2,rotating=arr.slice(1),rounds=[];
-  for(let r=0;r<n-1;r++){
-    const circle=[arr[0],...rotating],round=[];
-    for(let i=0;i<half;i++){const a=circle[i],b=circle[n-1-i];if(a&&b)round.push([a,b]);}
-    rounds.push(round);rotating.unshift(rotating.pop());
+// Picks which team sits out this round when the team count is odd.
+// forcedIds (round 0 only) lets the caller require two specific players to be the ones who sit out;
+// otherwise the team whose members have sat out the fewest times so far is benched, so nobody
+// sits out twice before everyone else has had a turn.
+// Picks which teams sit out this round: whenever the team count is odd there's always one
+// leftover, and on top of that a court limit can force more out if there isn't a court for
+// every possible match. Ranks teams by (worst member's bye count, then total bye count) so
+// whoever hasn't sat out yet gets benched before anyone sits out a second time.
+// Fairness clock shared across a whole schedule generation: lastUsed[id] holds the "tick"
+// at which that player last sat out (0 = never). Always benching whoever has the lowest
+// tick — rather than a raw count with a random tie-break — means ties go to whoever's gone
+// longest without a bye, so bad luck can't let the same person get picked again and again.
+function bumpLastUsed(lastUsed,ids){
+  const tick=(lastUsed.__tick=(lastUsed.__tick||0)+1);
+  ids.forEach(id=>{if(id!=null)lastUsed[id]=tick;});
+}
+
+// Rotating RR, free (unpinned) individuals: deterministically rotates who sits out each
+// round through a fair-queue rather than re-deciding it fresh each round, so — no matter
+// how many rounds are generated or how tight the court limit is — nobody sits out twice
+// before everyone else has at least once (previously a greedy per-round choice could let
+// the same person get unlucky several times in a row).
+// Pairs a list off two at a time, preferring combinations that have come up least so far
+// (costOf returns how many times that combination has already happened). A single greedy pass
+// can paint itself into a corner — the last two left may be the one combination already used —
+// so this retries with fresh random orders and keeps the best, stopping as soon as it finds a
+// set with no repeats at all. An odd item is left unpaired for the caller to deal with.
+function bestPairing(items,costOf,attempts=200){
+  let best=null,bestCost=Infinity;
+  for(let t=0;t<attempts;t++){
+    const pool=shuffle(items),pairs=[];
+    let cost=0;
+    while(pool.length>1){
+      const a=pool.shift();
+      let bestIdx=0,bestC=Infinity;
+      pool.forEach((c,i)=>{const n=costOf(a,c);if(n<bestC){bestC=n;bestIdx=i;}});
+      cost+=bestC;
+      pairs.push([a,pool.splice(bestIdx,1)[0]]);
+    }
+    if(cost<bestCost){bestCost=cost;best=pairs;if(cost===0)break;}
+  }
+  return best||[];
+}
+
+// ─── Schedule history ─────────────────────────────────────────────────────────
+// Who has partnered whom, who has faced whom, and how many rounds each player has sat out.
+// Keeping this separate from the generator is what lets a schedule be *continued* — adding
+// rounds to a tournament already under way carries on the same rotation instead of starting
+// it over and handing people partners they've already had.
+const pairKey=(a,b)=>[a,b].sort((x,y)=>x-y).join("-");
+function bumpPair(map,a,b){const k=pairKey(a,b);map[k]=(map[k]||0)+1;}
+
+function newHistory(players){
+  const sat={};players.forEach(p=>{sat[p.id]=0;});
+  return{partnered:{},opposed:{},sat};
+}
+
+// Rebuilds that history from rounds already on screen, so appended rounds pick up where the
+// played ones left off. A player added mid-tournament counts as having sat out everything so
+// far, which puts them first in line for a slot — exactly what you want for a late arrival.
+function historyFromRounds(rounds,players){
+  const h=newHistory(players);
+  (rounds||[]).forEach(round=>{
+    const played=new Set();
+    (round||[]).forEach(m=>{
+      const t1=Array.isArray(m.team1)?m.team1.filter(Boolean):[];
+      const t2=Array.isArray(m.team2)?m.team2.filter(Boolean):[];
+      [t1,t2].forEach(t=>{
+        t.forEach(p=>played.add(p.id));
+        if(t.length===2)bumpPair(h.partnered,t[0].id,t[1].id);
+      });
+      t1.forEach(p1=>t2.forEach(p2=>bumpPair(h.opposed,p1.id,p2.id)));
+    });
+    players.forEach(p=>{if(!played.has(p.id))h.sat[p.id]=(h.sat[p.id]||0)+1;});
+  });
+  return h;
+}
+
+// ─── Round building ───────────────────────────────────────────────────────────
+// Every round-robin round in the app comes through here, so doubles, singles, pinned partners
+// and fixed teams all get the same guarantees. A unit is a group that always plays or sits
+// together: a pinned pair, an already-formed fixed team, or a lone player. Units marked
+// `fixed` are teams as-is; loose ones are paired up each round (or stand alone in singles).
+//
+// Each round: work out how many teams can take the court, give those slots to whoever has sat
+// out most, pair the loose players into partnerships they haven't had, then match the teams
+// against opponents they've seen least. `history` is mutated as it goes, so successive calls
+// continue the same schedule.
+function buildRounds(units,teamSize,numRounds,matchLimit,history,forcedFirstRoundIds){
+  const fixedUnits=units.filter(u=>u.fixed).length;
+  const looseUnits=units.length-fixedUnits;
+  const maxTeams=fixedUnits+Math.floor(looseUnits/teamSize);
+  const matchesAllowed=Math.min(Math.floor(maxTeams/2),matchLimit??Infinity);
+  const teamsNeeded=matchesAllowed*2;
+  const everyone=units.flatMap(u=>u.members);
+  const unitSat=u=>Math.min(...u.members.map(p=>history.sat[p.id]||0));
+  const rounds=[];
+  for(let r=0;r<numRounds;r++){
+    // A forced round-1 bye takes the player's pinned partner along with them.
+    const forced=new Set(r===0&&forcedFirstRoundIds?forcedFirstRoundIds:[]);
+    const available=units.filter(u=>!u.members.some(p=>forced.has(p.id)));
+    // Whoever has sat out most gets first claim on a slot; ties broken at random.
+    const pool=shuffle(available).sort((a,b)=>unitSat(b)-unitSat(a));
+    const readyTeams=[],loose=[];
+    let teams=0;
+    for(const u of pool){
+      if(teams>=teamsNeeded)break;
+      if(u.fixed){readyTeams.push(u.members);teams++;}
+      else{loose.push(u.members[0]);if(loose.length%teamSize===0)teams++;}
+    }
+    while(loose.length%teamSize)loose.pop(); // a leftover can't field a team
+
+    const looseTeams=teamSize===1?loose.map(p=>[p]):
+      bestPairing(loose,(a,b)=>history.partnered[pairKey(a.id,b.id)]||0)
+        .map(([a,b])=>{bumpPair(history.partnered,a.id,b.id);return[a,b];});
+    const matches=bestPairing([...readyTeams,...looseTeams],(t1,t2)=>
+      t1.reduce((s,p1)=>s+t2.reduce((s2,p2)=>s2+(history.opposed[pairKey(p1.id,p2.id)]||0),0),0)
+    ).map(([t1,t2])=>{
+      t1.forEach(p1=>t2.forEach(p2=>bumpPair(history.opposed,p1.id,p2.id)));
+      return{team1:t1,team2:t2,score1:"",score2:""};
+    });
+
+    const played=new Set();
+    matches.forEach(m=>[...m.team1,...m.team2].forEach(p=>played.add(p.id)));
+    everyone.forEach(p=>{if(!played.has(p.id))history.sat[p.id]=(history.sat[p.id]||0)+1;});
+    rounds.push(matches);
   }
   return rounds;
 }
 
-function pairsToDoubles(roundPairs){
-  const matches=[],shuffled=shuffle(roundPairs);
-  for(let i=0;i+1<shuffled.length;i+=2)matches.push({team1:shuffled[i],team2:shuffled[i+1],score1:"",score2:""});
-  return matches;
-}
-
-function buildRRSchedule(slots,numRounds){
-  const unique=circleMethodRounds(slots);
-  if(unique.length===0)return[];
-  return Array.from({length:numRounds},(_,r)=>pairsToDoubles(unique[r%unique.length]));
-}
-
-// Fixed RR: teams circle-rotate against each other
-function generateFixedRoundRobin(players,numRounds){
+// The units a given mode plays in. For fixed teams, `existingRounds` (when a schedule is
+// already under way) is what the teams are read back from, so appended rounds keep the exact
+// partnerships people have been playing rather than re-drawing them.
+function scheduleUnits(players,mode,existingRounds){
+  if(mode==="singles")return{units:players.map(p=>({fixed:false,members:[p]})),teamSize:1};
+  if(mode==="fixed")return{units:fixedTeams(players,existingRounds).map(t=>({fixed:true,members:t})),teamSize:2};
   const{pinnedPairs,free}=extractPinnedPairs(players);
-  const shuffledFree=shuffle(free),freePairs=[];
-  for(let i=0;i+1<shuffledFree.length;i+=2)freePairs.push([shuffledFree[i],shuffledFree[i+1]]);
-  const allTeams=[...pinnedPairs,...freePairs];
-  if(allTeams.length<2)return[];
-  const arr=allTeams.length%2===0?[...allTeams]:[...allTeams,null];
-  const n=arr.length,half=n/2,rotating=arr.slice(1),uniqueRounds=[];
-  for(let r=0;r<n-1;r++){
-    const circle=[arr[0],...rotating],round=[];
-    for(let i=0;i<half;i++){const t1=circle[i],t2=circle[n-1-i];if(t1&&t2)round.push({team1:t1,team2:t2,score1:"",score2:""});}
-    uniqueRounds.push(round);rotating.unshift(rotating.pop());
-  }
-  return Array.from({length:numRounds},(_,r)=>uniqueRounds[r%uniqueRounds.length]);
+  return{units:[...pinnedPairs.map(pair=>({fixed:true,members:pair})),...free.map(p=>({fixed:false,members:[p]}))],teamSize:2};
 }
 
-// Rotating RR: individuals rotate partners
-function generateRotatingRoundRobin(players,numRounds){
-  const{pinnedPairs,free}=extractPinnedPairs(players);
-  if(free.length===0)return buildRRSchedule(pinnedPairs,numRounds);
-  const freeRounds=buildRRSchedule(free,numRounds);
-  return freeRounds.map(roundMatches=>{
-    if(pinnedPairs.length===0)return roundMatches;
-    const allTeams=[...pinnedPairs];
-    roundMatches.forEach(m=>{allTeams.push(m.team1);allTeams.push(m.team2);});
-    const shuffledTeams=shuffle(allTeams),matches=[];
-    for(let i=0;i+1<shuffledTeams.length;i+=2)matches.push({team1:shuffledTeams[i],team2:shuffledTeams[i+1],score1:"",score2:""});
-    return matches;
+function fixedTeams(players,existingRounds){
+  const byId={};players.forEach(p=>{byId[p.id]=p;});
+  const teams=[],seen=new Set(),placed=new Set();
+  (existingRounds||[]).forEach(round=>(round||[]).forEach(m=>[m.team1,m.team2].forEach(t=>{
+    if(!Array.isArray(t))return;
+    // Resolve against the current roster so renames show through and removed players drop out.
+    const members=t.filter(Boolean).map(p=>byId[p.id]).filter(Boolean);
+    if(members.length!==2)return;
+    const k=members.map(p=>p.id).sort().join("-");
+    if(seen.has(k))return;
+    seen.add(k);teams.push(members);members.forEach(p=>placed.add(p.id));
+  })));
+  // Anyone not already on a team — a fresh schedule, or players added since — pairs up now,
+  // keeping any pinned partners together.
+  const rest=players.filter(p=>!placed.has(p.id));
+  const{pinnedPairs,free}=extractPinnedPairs(rest);
+  const shuffledFree=shuffle(free);
+  pinnedPairs.forEach(pair=>teams.push(pair));
+  for(let i=0;i+1<shuffledFree.length;i+=2)teams.push([shuffledFree[i],shuffledFree[i+1]]);
+  return teams;
+}
+
+// Drops the lowest-court-priority matches when there are more matches than available courts,
+// preferring to keep matches whose teams have already sat out before (so the ones who haven't
+// sat out yet get the court this round).
+function capMatchesToCourts(matches,lastUsed,matchLimit){
+  const limit=matchLimit??Infinity;
+  if(matches.length<=limit)return matches;
+  const scored=matches.map(m=>{
+    const ids=[...(m.team1||[]),...(m.team2||[])].filter(Boolean).map(p=>p.id);
+    return{m,score:ids.length?Math.min(...ids.map(id=>lastUsed[id]||0)):0};
   });
+  scored.sort((a,b)=>a.score-b.score);
+  const benchCount=matches.length-limit;
+  const benchedIds=scored.slice(0,benchCount).flatMap(({m})=>[...(m.team1||[]),...(m.team2||[])].filter(Boolean).map(p=>p.id));
+  bumpLastUsed(lastUsed,benchedIds);
+  return scored.slice(benchCount).map(s=>s.m);
 }
 
-function generateRoundRobinRounds(players,mode,numRounds){
-  if(players.length<4)return[];
-  return mode==="fixed"?generateFixedRoundRobin(players,numRounds):generateRotatingRoundRobin(players,numRounds);
+// Doubles needs four people to make a match; singles only needs two.
+function minPlayersFor(mode){return mode==="singles"?2:4;}
+
+function generateRoundRobinRounds(players,mode,numRounds,firstRoundByeIds,matchLimit){
+  if(players.length<minPlayersFor(mode))return[];
+  const{units,teamSize}=scheduleUnits(players,mode);
+  return buildRounds(units,teamSize,numRounds,matchLimit,newHistory(players),firstRoundByeIds);
+}
+
+// Builds `count` further rounds onto a schedule that's already running, leaving the played
+// rounds and their scores untouched.
+function appendRoundRobinRounds(existingRounds,players,mode,count,matchLimit){
+  if(players.length<minPlayersFor(mode))return[];
+  const{units,teamSize}=scheduleUnits(players,mode,existingRounds);
+  return buildRounds(units,teamSize,count,matchLimit,historyFromRounds(existingRounds,players),null);
+}
+
+// Pool units are whole teams in fixed mode and individual players otherwise. When a schedule
+// is already running, the fixed teams come back from it so appended rounds keep them intact.
+function poolScheduleUnits(poolUnitList,mode,existingRounds){
+  if(mode!=="fixed")return scheduleUnits(poolUnitList,mode,existingRounds);
+  return{units:fixedTeams(poolUnitList.flat(),existingRounds).map(t=>({fixed:true,members:t})),teamSize:2};
+}
+
+// Every pool plays its Round N at the same time on the same courts, so one round's matches
+// from all pools are capped and numbered together — no two pools are ever sent to one court.
+function assignPoolCourts(roundByPool,numPools,courtLabels,lastUsed){
+  const combined=[];
+  for(let p=0;p<numPools;p++)(roundByPool[p]||[]).forEach(m=>combined.push({...m,__pool:p}));
+  const capped=capMatchesToCourts(combined,lastUsed,courtLabels.length);
+  const out={};
+  for(let p=0;p<numPools;p++)out[p]=[];
+  capped.forEach((m,i)=>{
+    const{__pool,...rest}=m;
+    out[__pool].push({...rest,court:courtLabels[i%courtLabels.length]});
+  });
+  return out;
 }
 
 // ─── Standings ────────────────────────────────────────────────────────────────
@@ -133,8 +316,15 @@ function computeStandings(players,rounds){
       });
     });
   }));
-  return players.map(p=>({...p,...stats[p.id],diff:(stats[p.id]?.pointsFor||0)-(stats[p.id]?.pointsAgainst||0)}))
-    .sort((a,b)=>b.wins!==a.wins?b.wins-a.wins:b.diff-a.diff);
+  return players.map(p=>{
+    const s=stats[p.id]||{wins:0,losses:0,pointsFor:0,pointsAgainst:0};
+    const gamesPlayed=s.wins+s.losses,diff=s.pointsFor-s.pointsAgainst;
+    return{...p,...s,gamesPlayed,diff,winPct:gamesPlayed?s.wins/gamesPlayed:0,avgDiff:gamesPlayed?diff/gamesPlayed:0};
+  })
+    // Ranked by win % and average point differential per game (not raw totals) so players
+    // who sat out more rounds — and so played fewer games — aren't penalized or boosted
+    // just for having a different number of games than everyone else.
+    .sort((a,b)=>b.winPct!==a.winPct?b.winPct-a.winPct:b.avgDiff-a.avgDiff);
 }
 
 function computePairStandings(rounds){
@@ -152,8 +342,13 @@ function computePairStandings(rounds){
       if(my>opp)pairMap[key].wins++;else pairMap[key].losses++;
     });
   }));
-  return Object.values(pairMap).map(p=>({...p,diff:p.pointsFor-p.pointsAgainst}))
-    .sort((a,b)=>b.wins!==a.wins?b.wins-a.wins:b.diff-a.diff);
+  return Object.values(pairMap).map(p=>{
+    const gamesPlayed=p.wins+p.losses,diff=p.pointsFor-p.pointsAgainst;
+    return{...p,gamesPlayed,diff,winPct:gamesPlayed?p.wins/gamesPlayed:0,avgDiff:gamesPlayed?diff/gamesPlayed:0};
+  })
+    // See computeStandings — ranked by rate, not raw totals, since teams don't always play
+    // the same number of games (e.g. one gets benched for a round due to a court limit).
+    .sort((a,b)=>b.winPct!==a.winPct?b.winPct-a.winPct:b.avgDiff-a.avgDiff);
 }
 
 // ─── Bracket ──────────────────────────────────────────────────────────────────
@@ -178,7 +373,10 @@ function buildBracketFromPairs(rankedPairs,numRounds){
 
 function buildBracketRounds(individualStandings,numRounds){
   const n=Math.pow(2,numRounds);
-  let players=[...individualStandings];
+  // Only the top n*2 individuals make the playoffs; lower-ranked players sit out entirely
+  // (e.g. an 8-team bracket from 10 players leaves the #9 and #10 seeds out) rather than
+  // being paired in against the full standings.
+  let players=individualStandings.slice(0,n*2);
   if(players.length%2!==0)players=players.slice(0,-1); // odd count: last place sits out, no free pairing
   const pairs=[];
   for(let i=0;i<players.length/2;i++){
@@ -250,17 +448,22 @@ function getPoolUnits(units, assignments, poolIdx) {
 }
 
 // ─── RR Team Block ────────────────────────────────────────────────────────────
-function RRTeamBlock({team,side,isWinner,hasWinner,rrEditingName,setRrEditingName,saveRrName,players,onSwap,swapTarget,setSwapTarget,rIdx,mIdx,poolIdx}){
+function RRTeamBlock({team,side,isWinner,hasWinner,rrEditingName,setRrEditingName,saveRrName,players,onSwap,swapTarget,setSwapTarget,rIdx,mIdx,poolIdx,readOnly}){
   if(!team||team.length===0)return<div style={{flex:1}}/>;
   const alignRight=side==="team1";
   return(
     <div style={{flex:1,textAlign:alignRight?"right":"left"}}>
       {team.filter(Boolean).map((p,pi)=>{
-        if(!p)return null;
-        const isEditing=rrEditingName?.playerId===p.id;
-        const isSwapping=swapTarget?.rIdx===rIdx&&swapTarget?.mIdx===mIdx&&swapTarget?.poolIdx===poolIdx&&swapTarget?.playerId===p.id;
-        const thisIds=new Set(team.filter(Boolean).map(x=>x.id));
-        const available=players.filter(pl=>!thisIds.has(pl.id));
+        // Guard against an id-less entry: `rrEditingName?.playerId===p.id` would otherwise be
+        // undefined===undefined for one, opening the name editor against a null and taking the
+        // whole app down with it.
+        if(!p||p.id==null)return null;
+        const isEditing=!readOnly&&rrEditingName?.playerId===p.id;
+        const isSwapping=!readOnly&&swapTarget?.rIdx===rIdx&&swapTarget?.mIdx===mIdx&&swapTarget?.poolIdx===poolIdx&&swapTarget?.side===side&&swapTarget?.playerId===p.id;
+        // Anyone but this player can be swapped in. Someone already playing this round trades
+        // places with them (see swapRRPlayer), so a swap still can't leave the same player
+        // listed in two spots — while a bench player simply subs in.
+        const available=players.filter(pl=>pl.id!==p.id);
         return(
           <div key={p.id} style={{marginBottom:pi>0?0:2}}>
             {pi>0&&<span style={{color:C.gray,fontWeight:400,fontSize:13}}> & </span>}
@@ -273,11 +476,11 @@ function RRTeamBlock({team,side,isWinner,hasWinner,rrEditingName,setRrEditingNam
                   onBlur={()=>saveRrName(p.id,rrEditingName.value)}
                   onClick={e=>e.stopPropagation()}/>
               ):(
-                <span title="Click to edit name"
-                  style={{fontWeight:700,fontSize:17,cursor:"text",color:isWinner?C.greenDark:hasWinner?C.gray:C.greenDark,borderBottom:`1px dashed ${C.grayLight}`,paddingBottom:1}}
-                  onClick={()=>setRrEditingName({playerId:p.id,value:p.name})}>{p.name}</span>
+                <span title={readOnly?undefined:"Click to edit name"}
+                  style={{fontWeight:700,fontSize:17,cursor:readOnly?"default":"text",color:isWinner?C.greenDark:hasWinner?C.gray:C.greenDark,borderBottom:readOnly?"none":`1px dashed ${C.grayLight}`,paddingBottom:1}}
+                  onClick={readOnly?undefined:()=>setRrEditingName({playerId:p.id,value:p.name})}>{p.name}</span>
               )}
-              {!isEditing&&<span title="Swap this player" style={{cursor:"pointer",fontSize:11,color:C.gray,padding:"0 2px",userSelect:"none"}}
+              {!isEditing&&!readOnly&&<span title="Swap this player" style={{cursor:"pointer",fontSize:11,color:C.gray,padding:"0 2px",userSelect:"none"}}
                 onClick={e=>{e.stopPropagation();setSwapTarget(isSwapping?null:{rIdx,mIdx,poolIdx,playerId:p.id,side});}}>⇅</span>}
             </span>
             {isSwapping&&available.length>0&&(
@@ -302,7 +505,13 @@ const TABS_POOL=["Players","Pool Setup","Pool Play","Pool Standings","Playoffs"]
 export default function FrogTournament(){
   const STORAGE_KEY="frog-tournament-state-v2";
 
-  function loadState(){try{const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);}catch(e){}return null;}
+  // A "?view=CODE" URL opens the app live-synced from Firestore instead of this browser's
+  // own local storage. Whether that joined session can edit (vs. just watch) is controlled
+  // by the host, live, via the "editable" flag on the shared doc (see viewMeta below).
+  const [viewCode]=useState(()=>{try{return new URLSearchParams(window.location.search).get("view")?.trim().toUpperCase()||null;}catch(e){return null;}});
+  const joined=!!viewCode;
+
+  function loadState(){if(joined)return null;try{const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);}catch(e){}return null;}
   const saved=loadState();
 
   const [tab,setTab]=useState(0);
@@ -310,9 +519,20 @@ export default function FrogTournament(){
   const [rrMode,setRrMode]=useState(saved?.rrMode??"rotating");
   const [rrNumRounds,setRrNumRounds]=useState(saved?.rrNumRounds??3);
   const [rrRounds,setRrRounds]=useState(saved?.rrRounds??[]);
-  const [playoffNumRounds,setPlayoffNumRounds]=useState(saved?.playoffNumRounds??2);
-  const [bracketRounds,setBracketRounds]=useState(saved?.bracketRounds??[]);
   const [nextId,setNextId]=useState(saved?.nextId??1);
+
+  // Playoff bracket state — supports multiple named brackets (e.g. "Playoff A" / "Playoff B")
+  const [numPlayoffBrackets,setNumPlayoffBrackets]=useState(saved?.numPlayoffBrackets??1);
+  const [bracketAssignmentOverrides,setBracketAssignmentOverrides]=useState(saved?.bracketAssignmentOverrides??{});
+  const [playoffBrackets,setPlayoffBrackets]=useState(()=>{
+    if(saved?.playoffBrackets)return saved.playoffBrackets;
+    if(saved?.bracketRounds?.length)return[{id:1,name:"Playoffs",numRounds:saved.bracketRounds.length,entryKeys:[],rounds:saved.bracketRounds}];
+    return[];
+  });
+  const [nextBracketId,setNextBracketId]=useState(saved?.nextBracketId??2);
+  const [activeBracketIdx,setActiveBracketIdx]=useState(0);
+  const [configuringPlayoffs,setConfiguringPlayoffs]=useState(false);
+  const [bracketSwapTarget,setBracketSwapTarget]=useState(null);
 
   // Pool play state
   const [poolPlay,setPoolPlay]=useState(saved?.poolPlay??false);
@@ -321,7 +541,6 @@ export default function FrogTournament(){
   const [poolRounds,setPoolRounds]=useState(saved?.poolRounds??{});  // {poolIdx: rounds[]}
   const [advanceCount,setAdvanceCount]=useState(saved?.advanceCount??2);
   const [playoffPairingMode,setPlayoffPairingMode]=useState(saved?.playoffPairingMode??"best-worst");
-  const [manualPlayoffPairs,setManualPlayoffPairs]=useState(saved?.manualPlayoffPairs??[]);
   const [poolQualifierOverrides,setPoolQualifierOverrides]=useState(saved?.poolQualifierOverrides??{});
 
   // UI state
@@ -331,20 +550,127 @@ export default function FrogTournament(){
   const [pinningPlayerId,setPinningPlayerId]=useState(null);
   const [rrEditingName,setRrEditingName]=useState(null);
   const [swapTarget,setSwapTarget]=useState(null);
+  const [firstRoundByeIds,setFirstRoundByeIds]=useState([]);
+  const [editingBracketName,setEditingBracketName]=useState(null);
+  const [courtsEnabled,setCourtsEnabled]=useState(saved?.courtsEnabled??false);
+  const [numCourts,setNumCourts]=useState(saved?.numCourts??4);
+  const [customCourtLabels,setCustomCourtLabels]=useState(saved?.customCourtLabels??"");
   const [showSaveModal,setShowSaveModal]=useState(false);
+  const [showLiveModal,setShowLiveModal]=useState(false);
+  const [linkCopied,setLinkCopied]=useState(false);
   const [saveFileName,setSaveFileName]=useState("");
   const [toast,setToast]=useState("");
   const importFileRef=useRef(null);
+  const [liveCode,setLiveCode]=useState(saved?.liveCode??null);
+  const [liveStatus,setLiveStatus]=useState("idle"); // idle | connecting | live | error
+  const [liveEditable,setLiveEditable]=useState(false); // host-controlled: can joined viewers also edit?
+  const [viewStatus,setViewStatus]=useState(joined?"connecting":"idle"); // connecting | live | notfound
+  const [viewMeta,setViewMeta]=useState(null); // {updatedAt, editable}
+  const liveDocCode=viewCode||liveCode;
+  // A joined session can edit once the host has flipped "editable" on for the shared doc.
+  const canEditJoined=joined&&viewMeta?.editable===true;
+  const readOnly=joined&&!canEditJoined;
 
   function currentStateSnapshot(){
-    return{players,rrMode,rrNumRounds,rrRounds,playoffNumRounds,bracketRounds,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,manualPlayoffPairs,poolQualifierOverrides};
+    return{players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels};
   }
 
-  // Persist
+  // Persist (skipped in read-only viewer mode — that browser is just watching someone
+  // else's tournament, it shouldn't overwrite whatever local tournament it had, if any)
   useEffect(()=>{
-    try{localStorage.setItem(STORAGE_KEY,JSON.stringify({players,rrMode,rrNumRounds,rrRounds,playoffNumRounds,bracketRounds,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,manualPlayoffPairs,poolQualifierOverrides}));}
+    if(joined)return;
+    try{localStorage.setItem(STORAGE_KEY,JSON.stringify({players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,liveCode}));}
     catch(e){}
-  },[players,rrMode,rrNumRounds,rrRounds,playoffNumRounds,bracketRounds,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,manualPlayoffPairs,poolQualifierOverrides]);
+  },[joined,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,liveCode]);
+
+  // Tracks the JSON this browser itself last wrote to Firestore, so the subscription below
+  // can tell "the server confirming my own edit" apart from "someone else's edit arrived" —
+  // otherwise a client that both pushes and listens (host, or an editor) would loop forever
+  // re-applying and re-pushing its own echoed writes.
+  const lastPushedRef=useRef(null);
+  // Set right before the subscription applies someone ELSE's update to local state. Both push
+  // effects below check it and skip their very next run — without this, a client that both
+  // listens and pushes (the host, or a co-editor) would automatically re-broadcast whatever it
+  // just received a moment later (a full snapshot, merge:false on the host's side), and if the
+  // other person made another edit in between, that echoed rebroadcast would silently clobber
+  // it. This is what made a co-editor's changes seem to "not go through."
+  const suppressNextPushRef=useRef(false);
+  // True from the moment a genuine local edit starts its debounce until it's actually sent.
+  // The subscription below checks this and *skips* applying an incoming remote update while
+  // it's true — otherwise applyState's full-state overwrite would silently wipe out whatever
+  // this browser just typed but hasn't pushed yet, any time someone else's change happened to
+  // arrive in that window (this was the main reason a co-editor's edits "weren't going through").
+  const hasPendingEditRef=useRef(false);
+
+  // Live sharing (host): while liveCode is set, push the current tournament state to
+  // Firestore (debounced) so anyone with the view link sees it update in near real time.
+  useEffect(()=>{
+    if(joined||!liveCode)return;
+    if(suppressNextPushRef.current){suppressNextPushRef.current=false;return;}
+    hasPendingEditRef.current=true;
+    setLiveStatus("connecting");
+    const snapshot=currentStateSnapshot();
+    const clean=fsSanitize(JSON.parse(JSON.stringify(snapshot))); // Firestore rejects `undefined` fields and nested arrays
+    const t=setTimeout(()=>{
+      hasPendingEditRef.current=false;
+      lastPushedRef.current=JSON.stringify(clean);
+      setDoc(doc(db,"tournaments",liveCode),{state:clean,updatedAt:Date.now(),editable:liveEditable},{merge:false})
+        .then(()=>setLiveStatus("live"))
+        .catch(()=>setLiveStatus("error"));
+    },600);
+    return()=>clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[joined,liveCode,liveEditable,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels]);
+
+  // Live editing (joined session): once the host has turned editing on for this share link,
+  // push this browser's changes back to the same shared doc too (debounced), same as the host.
+  useEffect(()=>{
+    if(!canEditJoined)return;
+    if(suppressNextPushRef.current){suppressNextPushRef.current=false;return;}
+    hasPendingEditRef.current=true;
+    const snapshot=currentStateSnapshot();
+    const clean=fsSanitize(JSON.parse(JSON.stringify(snapshot)));
+    const t=setTimeout(()=>{
+      hasPendingEditRef.current=false;
+      lastPushedRef.current=JSON.stringify(clean);
+      setDoc(doc(db,"tournaments",viewCode),{state:clean,updatedAt:Date.now()},{merge:true}).catch(()=>{});
+    },600);
+    return()=>clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[canEditJoined,viewCode,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels]);
+
+  function goLive(){
+    setLiveCode(prev=>prev||makeLiveCode());
+  }
+  function stopLive(){
+    if(liveCode)deleteDoc(doc(db,"tournaments",liveCode)).catch(()=>{});
+    setLiveCode(null);
+    setLiveStatus("idle");
+    setLiveEditable(false);
+  }
+
+  // Subscribe to the shared live doc — for the host (to see a co-editor's changes as they
+  // happen) and for a joined session (to see the host's changes, view-only or editable).
+  const firstSnapshotRef=useRef(true);
+  useEffect(()=>{
+    if(!liveDocCode)return;
+    const unsub=onSnapshot(doc(db,"tournaments",liveDocCode),snap=>{
+      if(!snap.exists()){if(joined)setViewStatus("notfound");return;}
+      const data=snap.data();
+      const rawState=JSON.stringify(data.state||{});
+      if(rawState!==lastPushedRef.current&&!hasPendingEditRef.current){
+        suppressNextPushRef.current=true;
+        applyState(fsUnsanitize(data.state||{}),{resetNav:joined&&firstSnapshotRef.current});
+      }
+      firstSnapshotRef.current=false;
+      if(joined){
+        setViewMeta({updatedAt:data.updatedAt,editable:data.editable===true});
+        setViewStatus("live");
+      }
+    },()=>{if(joined)setViewStatus("notfound");});
+    return unsub;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[liveDocCode]);
 
   useEffect(()=>{
     if(!toast)return;
@@ -365,28 +691,39 @@ export default function FrogTournament(){
     setToast(`Saved "${name||safeName}"`);
   }
 
+  // Applies a full saved/synced state object to all the relevant setters — shared by
+  // file import and the live Firestore viewer subscription. `resetNav` (skipped for live
+  // updates so a viewer's current tab doesn't keep jumping around as the host makes changes).
+  function applyState(s,{resetNav=true}={}){
+    setPlayers(s.players??[]);
+    setRrMode(s.rrMode??"rotating");
+    setRrNumRounds(s.rrNumRounds??3);
+    setRrRounds(s.rrRounds??[]);
+    setNumPlayoffBrackets(s.numPlayoffBrackets??1);
+    setBracketAssignmentOverrides(s.bracketAssignmentOverrides??{});
+    setPlayoffBrackets(s.playoffBrackets??(s.bracketRounds?.length?[{id:1,name:"Playoffs",numRounds:s.bracketRounds.length,entryKeys:[],rounds:s.bracketRounds}]:[]));
+    setNextBracketId(s.nextBracketId??2);
+    setNextId(s.nextId??1);
+    setPoolPlay(s.poolPlay??false);
+    setNumPools(s.numPools??2);
+    setPoolAssignments(s.poolAssignments??{});
+    setPoolRounds(s.poolRounds??{});
+    setAdvanceCount(s.advanceCount??2);
+    setPlayoffPairingMode(s.playoffPairingMode??"best-worst");
+    setPoolQualifierOverrides(s.poolQualifierOverrides??{});
+    setCourtsEnabled(s.courtsEnabled??false);
+    setNumCourts(s.numCourts??4);
+    setCustomCourtLabels(s.customCourtLabels??"");
+    if(resetNav){setActiveBracketIdx(0);setConfiguringPlayoffs(false);setTab(0);}
+  }
+
   function importSave(file){
     const reader=new FileReader();
     reader.onload=()=>{
       try{
         const parsed=JSON.parse(reader.result);
         const s=parsed?.state??parsed; // support raw state or wrapped save file
-        setPlayers(s.players??[]);
-        setRrMode(s.rrMode??"rotating");
-        setRrNumRounds(s.rrNumRounds??3);
-        setRrRounds(s.rrRounds??[]);
-        setPlayoffNumRounds(s.playoffNumRounds??2);
-        setBracketRounds(s.bracketRounds??[]);
-        setNextId(s.nextId??1);
-        setPoolPlay(s.poolPlay??false);
-        setNumPools(s.numPools??2);
-        setPoolAssignments(s.poolAssignments??{});
-        setPoolRounds(s.poolRounds??{});
-        setAdvanceCount(s.advanceCount??2);
-        setPlayoffPairingMode(s.playoffPairingMode??"best-worst");
-        setManualPlayoffPairs(s.manualPlayoffPairs??[]);
-        setPoolQualifierOverrides(s.poolQualifierOverrides??{});
-        setTab(0);
+        applyState(s);
         setToast(parsed?.name?`Loaded "${parsed.name}"`:"Loaded save file");
       }catch(e){
         setToast("Couldn't read that file — is it a valid save?");
@@ -398,12 +735,40 @@ export default function FrogTournament(){
   const [confirmingClear, setConfirmingClear] = useState(false);
 
   function clearAll(){
-    setPlayers([]);setRrMode("rotating");setRrNumRounds(3);setRrRounds([]);setPlayoffNumRounds(2);
-    setBracketRounds([]);setNextId(1);setPoolPlay(false);setNumPools(2);setPoolAssignments({});
+    setPlayers([]);setRrMode("rotating");setRrNumRounds(3);setRrRounds([]);
+    setNumPlayoffBrackets(1);setBracketAssignmentOverrides({});setPlayoffBrackets([]);setNextBracketId(2);
+    setActiveBracketIdx(0);setConfiguringPlayoffs(false);
+    setNextId(1);setPoolPlay(false);setNumPools(2);setPoolAssignments({});
     setPoolRounds({});setAdvanceCount(2);setPlayoffPairingMode("best-worst");
-    setManualPlayoffPairs([]);setPoolQualifierOverrides({});setTab(0);setConfirmingClear(false);
+    setPoolQualifierOverrides({});setTab(0);setConfirmingClear(false);
+    setFirstRoundByeIds([]);
+    setCourtsEnabled(false);setNumCourts(4);setCustomCourtLabels("");
     try{localStorage.removeItem(STORAGE_KEY);}catch(e){}
   }
+
+  // ─── Derived: court labels + the match cap they impose (undefined = no limit)
+  const courtLabels = useMemo(()=>{
+    if(!courtsEnabled)return[];
+    const custom=customCourtLabels.split(",").map(s=>s.trim()).filter(Boolean);
+    if(custom.length)return custom;
+    return Array.from({length:Math.max(1,numCourts)},(_,i)=>String(i+1));
+  },[courtsEnabled,customCourtLabels,numCourts]);
+  const courtMatchLimit = courtsEnabled&&courtLabels.length>0?courtLabels.length:undefined;
+
+  // ─── Derived: how many players sit out Round 1 of a rotating All Play schedule (0 if none).
+  // Partners pair up first (one player is left over if the count is odd), then teams are
+  // matched up two at a time (one team sits out if that count is odd) — whatever's left
+  // over after both steps (plus anyone extra a court limit forces out) is how many players
+  // get no game in Round 1. Simulated with the real generator so it always matches reality.
+  const firstRoundByeInfo = useMemo(()=>{
+    if(rrMode==="fixed"||players.length<minPlayersFor(rrMode))return{needed:0,eligible:[]};
+    const eligible=rrMode==="singles"?players:extractPinnedPairs(players).free;
+    const round0=generateRoundRobinRounds(players,rrMode,1,null,courtMatchLimit)[0]||[];
+    const playingIds=new Set();
+    round0.forEach(m=>[m.team1,m.team2].forEach(t=>{if(Array.isArray(t))t.forEach(p=>p&&playingIds.add(p.id));}));
+    const sitting=eligible.filter(p=>!playingIds.has(p.id));
+    return{needed:sitting.length,eligible};
+  },[players,rrMode,courtMatchLimit]);
 
   // ─── Derived: units for pool play (pairs in fixed, individuals in rotating)
   const poolUnits = useMemo(()=>{
@@ -436,36 +801,68 @@ export default function FrogTournament(){
 
   // ─── Generate pool play schedules
   function generatePoolPlay(){
-    const newPoolRounds={};
+    // Build each pool's schedule on its own first — courts aren't factored in yet here,
+    // since all pools play their Round N at the same time and share the same courts.
+    const perPoolUncapped=[];
     for(let p=0;p<numPools;p++){
-      const poolUnitList=getPool(p);
-      // Convert units to players list for the generator
-      let poolPlayers;
-      if(rrMode==="fixed"){
-        // units are already pairs — pass all players in those pairs
-        poolPlayers=poolUnitList.flat();
-        // Build fixed-style schedule directly from these teams
-        const arr=poolUnitList.length%2===0?[...poolUnitList]:[...poolUnitList,null];
-        const n=arr.length,half=n/2,rotating=arr.slice(1),uniqueRounds=[];
-        for(let r=0;r<n-1;r++){
-          const circle=[arr[0],...rotating],round=[];
-          for(let i=0;i<half;i++){const t1=circle[i],t2=circle[n-1-i];if(t1&&t2)round.push({team1:t1,team2:t2,score1:"",score2:""});}
-          uniqueRounds.push(round);rotating.unshift(rotating.pop());
-        }
-        newPoolRounds[p]=Array.from({length:rrNumRounds},(_,r)=>uniqueRounds.length?uniqueRounds[r%uniqueRounds.length]:[]);
-      } else {
-        // units are individual players
-        poolPlayers=poolUnitList;
-        newPoolRounds[p]=generateRotatingRoundRobin(poolPlayers,rrNumRounds);
+      // Uncapped here on purpose — the court limit is applied across all pools together below.
+      const{units,teamSize}=poolScheduleUnits(getPool(p),rrMode);
+      perPoolUncapped[p]=buildRounds(units,teamSize,rrNumRounds,undefined,newHistory(units.flatMap(u=>u.members)),null);
+    }
+
+    const newPoolRounds={};
+    for(let p=0;p<numPools;p++)newPoolRounds[p]=perPoolUncapped[p];
+
+    if(courtsEnabled&&courtLabels.length>0){
+      const lastUsed={};
+      for(let p=0;p<numPools;p++)newPoolRounds[p]=[];
+      for(let r=0;r<rrNumRounds;r++){
+        const byPool={};
+        for(let p=0;p<numPools;p++)byPool[p]=perPoolUncapped[p][r]||[];
+        const assigned=assignPoolCourts(byPool,numPools,courtLabels,lastUsed);
+        for(let p=0;p<numPools;p++)newPoolRounds[p][r]=assigned[p];
       }
     }
+
     setPoolRounds(newPoolRounds);
     setTab(2); // Pool Play tab
   }
 
+  // ─── Add a round to a tournament already under way, without touching what's been played.
+  // The new round continues the rotation: it reads back who has partnered whom, who has faced
+  // whom and who has sat out most from the rounds already on screen, so it keeps giving people
+  // fresh partners and evens out the sit-outs rather than starting over.
+  function addRound(){
+    if(poolPlay){
+      const nextByPool={};
+      for(let p=0;p<numPools;p++){
+        const{units,teamSize}=poolScheduleUnits(getPool(p),rrMode,poolRounds[p]);
+        const poolPlayers=units.flatMap(u=>u.members);
+        const extra=buildRounds(units,teamSize,1,undefined,historyFromRounds(poolRounds[p]||[],poolPlayers),null);
+        nextByPool[p]=extra[0]||[];
+      }
+      if(!Object.values(nextByPool).some(ms=>ms.length)){setToast("Not enough players in a pool for another round");return;}
+      const assigned=courtsEnabled&&courtLabels.length>0?assignPoolCourts(nextByPool,numPools,courtLabels,{}):nextByPool;
+      setPoolRounds(prev=>{
+        const next={...prev};
+        for(let p=0;p<numPools;p++)next[p]=[...(prev[p]||[]),assigned[p]||[]];
+        return next;
+      });
+    } else {
+      const extra=appendRoundRobinRounds(rrRounds,players,rrMode,1,courtMatchLimit);
+      if(!extra.length||!extra[0].length){setToast(`Need at least ${minPlayers} players for another round`);return;}
+      setRrRounds(prev=>[...prev,...extra]);
+    }
+    // Keep the generator's round count in step, so a later re-randomize rebuilds the same
+    // number of rounds people have actually been playing.
+    setRrNumRounds(n=>n+1);
+    setToast("Round added");
+  }
+
   // ─── Non-pool RR
   function generateRR(){
-    const rounds=generateRoundRobinRounds(players,rrMode,rrNumRounds);
+    const byeIds=firstRoundByeInfo.needed>0&&firstRoundByeIds.length>0?firstRoundByeIds:null;
+    const rounds=generateRoundRobinRounds(players,rrMode,rrNumRounds,byeIds,courtMatchLimit);
     setRrRounds(rounds);
     setTab(1);
   }
@@ -493,54 +890,128 @@ export default function FrogTournament(){
     return qualifiers;
   }
 
-  // ─── Generate playoffs from pool qualifiers
-  function generatePoolPlayoffs(){
-    const qualifiers=getQualifiers();
-
-    if(rrMode==="fixed"){
-      // Qualifiers are pairs — seed Pool A #1 vs Pool B #2, Pool B #1 vs Pool A #2, etc.
-      // Standard cross-pool seeding: interleave pools
-      const teams=[];
-      const maxRank=Math.max(...qualifiers.map(q=>q.rank));
-      for(let rank=0;rank<=maxRank;rank++){
-        const rankGroup=qualifiers.filter(q=>q.rank===rank).sort((a,b)=>a.pool-b.pool);
-        rankGroup.forEach(q=>teams.push(q.entry));
+  // ─── Playoff entry pool: the ranked list of assignable units (individuals in rotating
+  // mode, teams in fixed mode) that playoff brackets are built and swapped from — sourced
+  // from pool qualifiers when pool play is on, otherwise the overall standings.
+  function getPlayoffEntryPool(){
+    if(poolPlay){
+      const qualifiers=getQualifiers();
+      if(rrMode==="fixed"){
+        // Standard cross-pool seeding: interleave pools by rank (P1#1, P2#1, P1#2, P2#2…)
+        const teams=[];
+        const maxRank=Math.max(-1,...qualifiers.map(q=>q.rank));
+        for(let rank=0;rank<=maxRank;rank++){
+          qualifiers.filter(q=>q.rank===rank).sort((a,b)=>a.pool-b.pool).forEach(q=>teams.push(q.entry));
+        }
+        return teams.map(t=>({key:t.players.map(p=>p.id).sort((a,b)=>a-b).join("-"),name:t.players.map(p=>p.name).join(" & "),raw:t}));
       }
-      const rawRounds=buildBracketFromPairs(teams,playoffNumRounds);
-      setBracketRounds(rawRounds);
-    } else {
-      // Qualifiers are individuals — need to pair them for playoffs
-      const individuals=qualifiers.map(q=>q.entry);
-      if(playoffPairingMode==="best-worst"){
-        const rawRounds=buildBracketRounds(individuals,playoffNumRounds);
-        setBracketRounds(rawRounds);
-      } else if(playoffPairingMode==="1-2"){
-        // Pair 1st with 2nd, 3rd with 4th...
-        const pairs=[];
-        for(let i=0;i+1<individuals.length;i+=2)
-          pairs.push({players:[individuals[i],individuals[i+1]],seed:Math.floor(i/2)+1});
-        const rawRounds=buildBracketFromPairs(pairs,playoffNumRounds);
-        setBracketRounds(rawRounds);
-      } else {
-        // Manual — use manualPlayoffPairs
-        const pairs=manualPlayoffPairs.map((pair,i)=>({players:pair,seed:i+1}));
-        const rawRounds=buildBracketFromPairs(pairs,playoffNumRounds);
-        setBracketRounds(rawRounds);
-      }
+      return qualifiers.map(q=>({key:String(q.entry.id),name:q.entry.name,raw:q.entry}));
     }
-    setTab(poolPlay?4:3);
+    if(rrMode==="fixed"){
+      return computePairStandings(rrRounds).map(t=>({key:t.players.map(p=>p.id).sort((a,b)=>a-b).join("-"),name:t.players.map(p=>p.name).join(" & "),raw:t}));
+    }
+    return computeStandings(players,rrRounds).map(p=>({key:String(p.id),name:p.name,raw:p}));
   }
 
-  // ─── Non-pool playoffs
-  function generatePlayoffs(){
-    let rawRounds;
-    if(rrMode==="fixed"){
-      rawRounds=buildBracketFromPairs(computePairStandings(rrRounds),playoffNumRounds);
-    } else {
-      rawRounds=buildBracketRounds(computeStandings(players,rrRounds),playoffNumRounds);
-    }
-    setBracketRounds(rawRounds);
-    setTab(3);
+  // Splits a ranked entry list into N buckets — by default a contiguous block per bracket
+  // (top players.length/N to bracket 1, next chunk to bracket 2, …), overridable per entry.
+  // overrides[key] === -1 means "excluded from playoffs entirely" (left on the bench,
+  // available later as a swap-in); anything else unset falls back to an even block split.
+  function splitEntriesIntoBrackets(entries,numBrackets,overrides){
+    const perBracket=Array.from({length:numBrackets},()=>[]);
+    const size=Math.max(1,Math.ceil(entries.length/numBrackets));
+    entries.forEach((e,i)=>{
+      const ov=overrides[e.key];
+      if(ov===-1)return;
+      let b=ov;
+      if(b==null||b<0||b>=numBrackets)b=Math.min(numBrackets-1,Math.floor(i/size));
+      perBracket[b].push(e);
+    });
+    return perBracket;
+  }
+
+  function autoRoundsForCount(n){
+    return n<2?1:Math.max(1,Math.ceil(Math.log2(n)));
+  }
+
+  function defaultBracketName(i){return`Playoff ${String.fromCharCode(65+i)}`;}
+
+  // How many bracket slots a bucket of entries fills: rotating-mode entries are individuals
+  // that get paired into doubles teams first, so they fill half as many slots. Fixed teams
+  // and singles players each take a slot of their own.
+  function bracketTeamCount(entryCount){return rrMode==="rotating"?Math.floor(entryCount/2):entryCount;}
+
+  // ─── Generate every playoff bracket from the current entry pool + assignment
+  function generateAllPlayoffBrackets(){
+    const entries=getPlayoffEntryPool();
+    const perBracket=splitEntriesIntoBrackets(entries,numPlayoffBrackets,bracketAssignmentOverrides);
+    const isFixed=rrMode==="fixed";
+    let idCounter=nextBracketId;
+    const newBrackets=perBracket.map((bucket,i)=>{
+      const numRounds=autoRoundsForCount(bracketTeamCount(bucket.length));
+      let rounds;
+      if(isFixed){
+        const pairs=bucket.map((e,idx)=>({players:e.raw.players,seed:idx+1}));
+        rounds=buildBracketFromPairs(pairs,numRounds);
+      } else if(rrMode==="singles"){
+        // Each player is their own one-person "team", seeded straight down the standings.
+        rounds=buildBracketFromPairs(bucket.map((e,idx)=>({players:[e.raw],seed:idx+1})),numRounds);
+      } else if(playoffPairingMode==="1-2"){
+        const pairs=[];
+        for(let k=0;k+1<bucket.length;k+=2)pairs.push({players:[bucket[k].raw,bucket[k+1].raw],seed:Math.floor(k/2)+1});
+        rounds=buildBracketFromPairs(pairs,numRounds);
+      } else {
+        rounds=buildBracketRounds(bucket.map(e=>e.raw),numRounds);
+      }
+      const existing=playoffBrackets[i];
+      const id=existing?.id??idCounter++;
+      return{id,name:existing?.name??defaultBracketName(i),numRounds,entryKeys:bucket.map(e=>e.key),rounds};
+    });
+    setPlayoffBrackets(newBrackets);
+    setNextBracketId(idCounter);
+    setActiveBracketIdx(0);
+    setConfiguringPlayoffs(false);
+    setTab(playoffsTabIdx);
+  }
+
+  function renamePlayoffBracket(idx,name){
+    setPlayoffBrackets(prev=>prev.map((b,i)=>i===idx?{...b,name}:b));
+  }
+
+  // Player ids currently seated in ANY bracket's first round, so swaps never create a
+  // duplicate (the same person/team playing in two brackets — or two spots — at once).
+  function playoffUsedPlayerIds(){
+    const ids=new Set();
+    playoffBrackets.forEach(b=>{
+      (b.rounds[0]||[]).forEach(m=>{
+        [m.team1,m.team2].forEach(t=>{if(Array.isArray(t))t.filter(Boolean).forEach(p=>ids.add(p.id));});
+      });
+    });
+    return ids;
+  }
+
+  // Fixed mode: entries are already-formed 2-player teams, so a swap replaces the whole side.
+  function swapBracketEntry(bracketId,mIdx,side,newEntry){
+    setPlayoffBrackets(prev=>prev.map(b=>{
+      if(b.id!==bracketId)return b;
+      const newTeam=Array.isArray(newEntry.raw?.players)?newEntry.raw.players:[newEntry.raw];
+      const rounds=b.rounds.map((rnd,ri)=>ri!==0?rnd:rnd.map((m,mi)=>mi!==mIdx?m:{...m,[side]:newTeam}));
+      return{...b,rounds:propagateWinners(rounds)};
+    }));
+  }
+
+  // Rotating mode: entries are individuals, so a swap replaces just one member of the team,
+  // keeping their partner in place (swapping the whole side would leave the other member solo).
+  function swapBracketPlayer(bracketId,mIdx,side,outPlayerId,newEntry){
+    setPlayoffBrackets(prev=>prev.map(b=>{
+      if(b.id!==bracketId)return b;
+      const rounds=b.rounds.map((rnd,ri)=>ri!==0?rnd:rnd.map((m,mi)=>{
+        if(mi!==mIdx)return m;
+        const team=Array.isArray(m[side])?m[side]:[];
+        return{...m,[side]:team.map(p=>p&&p.id===outPlayerId?newEntry.raw:p)};
+      }));
+      return{...b,rounds:propagateWinners(rounds)};
+    }));
   }
 
   function updateRRScore(rIdx,mIdx,field,val){
@@ -555,11 +1026,12 @@ export default function FrogTournament(){
     });
   }
 
-  function updateBracketScore(rIdx,mIdx,field,val){
-    setBracketRounds(prev=>{
-      const updated=prev.map((r,ri)=>ri!==rIdx?r:r.map((m,mi)=>mi!==mIdx?m:{...m,[field]:val}));
-      return propagateWinners(updated);
-    });
+  function updateBracketScore(bracketId,rIdx,mIdx,field,val){
+    setPlayoffBrackets(prev=>prev.map(b=>{
+      if(b.id!==bracketId)return b;
+      const updated=b.rounds.map((r,ri)=>ri!==rIdx?r:r.map((m,mi)=>mi!==mIdx?m:{...m,[field]:val}));
+      return{...b,rounds:propagateWinners(updated)};
+    }));
   }
 
   function addPlayer(){
@@ -567,36 +1039,86 @@ export default function FrogTournament(){
     const p={id:nextId,name:newPlayerName.trim(),pinnedPartnerId:null};
     setPlayers(prev=>[...prev,p]);
     setNextId(n=>n+1);setNewPlayerName("");setAddingPlayer(false);
+    // Someone joining mid-tournament gets worked into the rounds that haven't been played yet;
+    // anything already scored stays exactly as it was. The replacements continue the existing
+    // rotation rather than starting it over, so nobody gets handed a partner they've had.
     if(rrRounds.length>0&&!poolPlay){
       const updatedPlayers=[...players,p];
       const firstUnscored=rrRounds.findIndex(r=>r.every(m=>m.score1===""&&m.score2===""));
-      if(firstUnscored===-1){const extra=generateRoundRobinRounds(updatedPlayers,rrMode,rrNumRounds);setRrRounds(prev=>[...prev,...extra.slice(prev.length)]);}
-      else{const scored=rrRounds.slice(0,firstUnscored);const newR=generateRoundRobinRounds(updatedPlayers,rrMode,Math.max(rrNumRounds-firstUnscored,1));setRrRounds([...scored,...newR]);}
+      if(firstUnscored!==-1){
+        const played=rrRounds.slice(0,firstUnscored);
+        const rebuilt=appendRoundRobinRounds(played,updatedPlayers,rrMode,rrRounds.length-firstUnscored,courtMatchLimit);
+        setRrRounds([...played,...rebuilt]);
+      }
     }
   }
 
   function removePlayer(id){setPlayers(prev=>prev.filter(p=>p.id!==id).map(p=>p.pinnedPartnerId===id?{...p,pinnedPartnerId:null}:p));}
-  function saveEditPlayer(id,name){setPlayers(prev=>prev.map(p=>p.id===id?{...p,name}:p));setEditingPlayer(null);}
+
+  // A player's name gets copied into every match a schedule was generated for (team1/team2
+  // hold snapshots of the player, not just an id), plus playoff entries — so a rename has to
+  // cascade into all of those, not just the roster, or old names linger in Pool Play, Pool
+  // Standings and Playoffs even though Pool Setup (which looks the id up live) shows the new one.
+  function patchRoundsPlayerName(rounds,id,name){
+    return rounds.map(round=>round.map(match=>({...match,
+      team1:Array.isArray(match.team1)?match.team1.map(p=>p&&p.id===id?{...p,name}:p):match.team1,
+      team2:Array.isArray(match.team2)?match.team2.map(p=>p&&p.id===id?{...p,name}:p):match.team2,
+    })));
+  }
+  function patchEntryPlayerName(entry,id,name){
+    const patched={...entry};
+    if(patched.id===id)patched.name=name;
+    if(Array.isArray(patched.players))patched.players=patched.players.map(p=>p&&p.id===id?{...p,name}:p);
+    return patched;
+  }
+  function renamePlayerEverywhere(id,name){
+    setPlayers(prev=>prev.map(p=>p.id===id?{...p,name}:p));
+    setRrRounds(prev=>patchRoundsPlayerName(prev,id,name));
+    setPoolRounds(prev=>{const next={};Object.keys(prev).forEach(k=>{next[k]=patchRoundsPlayerName(prev[k],id,name);});return next;});
+    setPlayoffBrackets(prev=>prev.map(b=>({...b,rounds:patchRoundsPlayerName(b.rounds,id,name)})));
+    // Pool qualifier overrides (manually toggled in Pool Standings) snapshot each entry too.
+    setPoolQualifierOverrides(prev=>{
+      const next={};
+      Object.keys(prev).forEach(k=>{next[k]=prev[k].map(e=>patchEntryPlayerName(e,id,name));});
+      return next;
+    });
+  }
+
+  function saveEditPlayer(id,name){
+    if(!name.trim())return;
+    renamePlayerEverywhere(id,name.trim());
+    setEditingPlayer(null);
+  }
 
   function saveRrName(id,name){
     if(!name.trim())return;
-    setPlayers(prev=>prev.map(p=>p.id===id?{...p,name:name.trim()}:p));
-    const patchRounds=rounds=>rounds.map(round=>round.map(match=>({...match,
-      team1:Array.isArray(match.team1)?match.team1.map(p=>p&&p.id===id?{...p,name:name.trim()}:p):match.team1,
-      team2:Array.isArray(match.team2)?match.team2.map(p=>p&&p.id===id?{...p,name:name.trim()}:p):match.team2,
-    })));
-    setRrRounds(patchRounds);
-    setPoolRounds(prev=>{const next={};Object.keys(prev).forEach(k=>{next[k]=patchRounds(prev[k]);});return next;});
+    renamePlayerEverywhere(id,name.trim());
     setRrEditingName(null);
   }
 
+  // Swaps one player in a round-robin round. The swap is applied across the whole round, not
+  // just the one slot: if the player coming in is already playing somewhere else this round,
+  // the two trade places rather than the incoming player being listed twice.
   function swapRRPlayer(rIdx,mIdx,side,outId,inId,poolIdx=null){
-    const inPlayer=players.find(p=>p.id===inId);if(!inPlayer)return;
-    const patchMatch=m=>{if(!Array.isArray(m[side]))return m;return{...m,[side]:m[side].map(p=>p&&p.id===outId?inPlayer:p)};};
+    const inPlayer=players.find(p=>p.id===inId),outPlayer=players.find(p=>p.id===outId);
+    if(!inPlayer||!outPlayer||inId===outId)return;
+    const patchRound=round=>round.map((m,mi)=>{
+      const next={...m};
+      ["team1","team2"].forEach(s=>{
+        if(!Array.isArray(m[s]))return;
+        next[s]=m[s].map(p=>{
+          if(!p)return p;
+          if(mi===mIdx&&s===side&&p.id===outId)return inPlayer;
+          if(p.id===inId)return outPlayer;
+          return p;
+        });
+      });
+      return next;
+    });
     if(poolIdx!==null){
-      setPoolRounds(prev=>{const poolR=[...(prev[poolIdx]||[])];poolR[rIdx]=poolR[rIdx].map((m,mi)=>mi!==mIdx?m:patchMatch(m));return{...prev,[poolIdx]:poolR};});
+      setPoolRounds(prev=>{const poolR=[...(prev[poolIdx]||[])];poolR[rIdx]=patchRound(poolR[rIdx]||[]);return{...prev,[poolIdx]:poolR};});
     } else {
-      setRrRounds(prev=>prev.map((r,ri)=>ri!==rIdx?r:r.map((m,mi)=>mi!==mIdx?m:patchMatch(m))));
+      setRrRounds(prev=>prev.map((r,ri)=>ri!==rIdx?r:patchRound(r)));
     }
   }
 
@@ -616,6 +1138,7 @@ export default function FrogTournament(){
   }
 
   const standings=useMemo(()=>rrMode==="fixed"?computePairStandings(rrRounds):computeStandings(players,rrRounds),[players,rrRounds,rrMode]);
+  const minPlayers=minPlayersFor(rrMode);
   const pinnedPairs=useMemo(()=>extractPinnedPairs(players).pinnedPairs,[players]);
   const TABS=poolPlay?TABS_POOL:TABS_NORMAL;
 
@@ -720,7 +1243,7 @@ export default function FrogTournament(){
     return(
       <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
         <thead>
-          <tr>{[showQualify?"":"#",mode==="fixed"?"Team":"Player","W","L","PF","PA","+/-",showQualify?"✓":null].filter(Boolean).map((h,i)=>(
+          <tr>{[showQualify?"":"#",mode==="fixed"?"Team":"Player","GP","W","L","Win%","PF","PA","Avg +/-",showQualify?"✓":null].filter(Boolean).map((h,i)=>(
             <th key={i} style={{...S.th,textAlign:i>1?"center":"left"}}>{h}</th>
           ))}</tr>
         </thead>
@@ -729,18 +1252,21 @@ export default function FrogTournament(){
             const key=mode==="fixed"?entry.players.map(p=>p.id).join("-"):entry.id;
             const name=mode==="fixed"?entry.players.map(p=>p.name).join(" & "):entry.name;
             const qual=showQualify&&isQualified(entry);
+            const avgDiff=entry.avgDiff??0;
             return(
               <tr key={key} style={{background:qual?"#F0FAE8":"inherit"}}>
                 <td style={{...S.td(i),textAlign:"center",fontWeight:700}}>{i===0?"🥇":i===1?"🥈":i===2?"🥉":i+1}</td>
                 <td style={S.td(i)}>{name}{qual&&<span style={{...S.badge(C.lime,C.greenDark),marginLeft:6,fontSize:10}}>Advances</span>}</td>
+                <td style={{...S.td(i),textAlign:"center",color:C.gray}}>{entry.gamesPlayed??(entry.wins+entry.losses)}</td>
                 <td style={{...S.td(i),textAlign:"center"}}><span style={S.badge(C.greenMid)}>{entry.wins}</span></td>
                 <td style={{...S.td(i),textAlign:"center"}}><span style={S.badge(entry.losses>0?C.red:C.gray)}>{entry.losses}</span></td>
+                <td style={{...S.td(i),textAlign:"center",fontWeight:700}}>{Math.round((entry.winPct??0)*100)}%</td>
                 <td style={{...S.td(i),textAlign:"center"}}>{entry.pointsFor}</td>
                 <td style={{...S.td(i),textAlign:"center"}}>{entry.pointsAgainst}</td>
-                <td style={{...S.td(i),textAlign:"center",fontWeight:700,color:entry.diff>=0?C.greenMid:C.red}}>{entry.diff>=0?`+${entry.diff}`:entry.diff}</td>
+                <td style={{...S.td(i),textAlign:"center",fontWeight:700,color:avgDiff>=0?C.greenMid:C.red}}>{avgDiff>=0?"+":""}{avgDiff.toFixed(1)}</td>
                 {showQualify&&(
                   <td style={{...S.td(i),textAlign:"center"}}>
-                    <input type="checkbox" checked={qual} onChange={e=>toggleQualifier(entry,e.target.checked)}/>
+                    <input type="checkbox" checked={qual} disabled={readOnly} onChange={e=>toggleQualifier(entry,e.target.checked)}/>
                   </td>
                 )}
               </tr>
@@ -752,10 +1278,12 @@ export default function FrogTournament(){
   }
 
   // ── Bracket View
-  function BracketView(){
-    if(!bracketRounds.length)return null;
-    const live=propagateWinners(bracketRounds);
-    const numR=live.length,MATCH_H=100,SLOT_H=180,COL_W=260,GAP_W=52,HEADER_H=44;
+  function BracketView({bracket}){
+    if(!bracket||!bracket.rounds.length)return null;
+    const live=propagateWinners(bracket.rounds);
+    const usedIds=playoffUsedPlayerIds();
+    const entryPool=getPlayoffEntryPool();
+    const numR=live.length,MATCH_H=140,SLOT_H=220,COL_W=320,GAP_W=52,HEADER_H=44;
     const firstCount=live[0].length,totalH=firstCount*SLOT_H,totalW=numR*COL_W+(numR-1)*GAP_W;
     const cy=(r,m)=>{const s=SLOT_H*Math.pow(2,r);return m*s+s/2;};
     const top=(r,m)=>cy(r,m)-MATCH_H/2;
@@ -787,22 +1315,87 @@ export default function FrogTournament(){
                   const rows=[{side:"team1",team:match.team1,sf:"score1",seed:match.seed1},{side:"team2",team:match.team2,sf:"score2",seed:match.seed2}];
                   return(
                     <div key={match.id||mIdx} style={{position:"absolute",left:colLeft,top:t,width:COL_W,background:champ?`linear-gradient(135deg,${C.greenDark},${C.green})`:C.white,borderRadius:10,boxShadow:champ?"0 0 16px rgba(126,200,80,0.35)":"0 2px 8px rgba(0,0,0,0.13)",border:champ?`2px solid ${C.lime}`:`1.5px solid ${C.grayLight}`,overflow:"hidden"}}>
+                      {courtsEnabled&&courtLabels.length>0&&!(t1b&&t2b)&&(
+                        <div style={{padding:"5px 12px 0"}}>
+                          {readOnly?(
+                            <span style={{...S.badge(champ?"rgba(255,255,255,0.15)":C.grayLight,champ?C.limeLight:C.greenDark),fontSize:10}}>🎾 Court {match.court??courtLabels[mIdx%courtLabels.length]}</span>
+                          ):(
+                            <select value={match.court??courtLabels[mIdx%courtLabels.length]} onChange={e=>updateBracketScore(bracket.id,rIdx,mIdx,"court",e.target.value)}
+                              style={{...S.badge(champ?"rgba(255,255,255,0.15)":C.grayLight,champ?C.limeLight:C.greenDark),fontSize:10,border:"none",cursor:"pointer",fontFamily:"inherit",fontWeight:700,paddingRight:6}}>
+                              {courtLabels.map(c=><option key={c} value={c}>🎾 Court {c}</option>)}
+                            </select>
+                          )}
+                        </div>
+                      )}
                       {rows.map(({side,team,sf,seed},si)=>{
                         const bye=isBye(team),empty=!bye&&(!team||!Array.isArray(team)||!team.filter(Boolean).length);
                         const win=w===side,members=Array.isArray(team)?team.filter(Boolean):[];
                         const bg=bye?(champ?"rgba(0,0,0,0.18)":"#efefef"):win?(champ?"rgba(126,200,80,0.18)":"#E8F8E0"):empty?(champ?"rgba(255,255,255,0.05)":C.cream):(champ?"rgba(255,255,255,0.06)":C.white);
                         const nc=bye?C.gray:empty?C.gray:champ?(win?C.lime:C.limeLight):(win?C.greenDark:C.charcoal);
+                        // Fixed mode: entries are whole teams, so the whole side swaps at once.
+                        // Rotating mode: entries are individuals, so each player swaps on their own
+                        // (replacing the whole side would leave their partner without a teammate).
+                        const isFixedMode=rrMode==="fixed";
+                        const teamSwapping=rIdx===0&&isFixedMode&&!bye&&bracketSwapTarget?.bracketId===bracket.id&&bracketSwapTarget?.mIdx===mIdx&&bracketSwapTarget?.side===side&&bracketSwapTarget?.playerId==null;
+                        const teamAvailable=teamSwapping?entryPool.filter(e=>{
+                          const ids=Array.isArray(e.raw?.players)?e.raw.players.map(p=>p.id):[e.raw.id];
+                          return!ids.some(id=>usedIds.has(id));
+                        }):[];
                         return(
                           <div key={side}>
                             {si===1&&<div style={{height:1,background:champ?"rgba(255,255,255,0.15)":C.grayLight}}/>}
-                            <div style={{display:"flex",alignItems:"center",gap:6,padding:"11px 12px",background:bg,minHeight:50}}>
+                            <div style={{display:"flex",alignItems:"flex-start",gap:6,padding:"11px 12px",background:bg,minHeight:50}}>
                               {seed&&!bye&&<span style={{...S.badge(win?C.lime:C.grayLight,win?C.greenDark:C.gray),minWidth:26,textAlign:"center",fontSize:12,padding:"2px 6px",flexShrink:0}}>{seed}</span>}
-                              <span style={{flex:1,fontWeight:win?700:500,fontSize:13,color:nc,fontStyle:(empty||bye)?"italic":"normal",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
-                                {bye?"— BYE —":empty?"TBD":members.map(p=>p?.name??"?").join(" & ")}
+                              <span style={{flex:1,minWidth:0,fontWeight:win?700:500,fontSize:13,color:nc,fontStyle:(empty||bye)?"italic":"normal",whiteSpace:"normal",wordBreak:"break-word",lineHeight:1.35,paddingTop:2}}>
+                                {bye?"— BYE —":empty?"TBD":members.map((p,pi)=>{
+                                  const isPlayerSwapping=rIdx===0&&!isFixedMode&&bracketSwapTarget?.bracketId===bracket.id&&bracketSwapTarget?.mIdx===mIdx&&bracketSwapTarget?.side===side&&bracketSwapTarget?.playerId===p.id;
+                                  return(
+                                    <span key={p?.id??pi} style={{display:"inline-flex",alignItems:"center",gap:3}}>
+                                      {pi>0&&<span style={{fontWeight:400,color:C.gray}}> & </span>}{p?.name??"?"}
+                                      {rIdx===0&&!isFixedMode&&!readOnly&&<span title="Swap this player" style={{cursor:"pointer",fontSize:11,color:champ?C.limeLight:C.gray,padding:"0 2px",userSelect:"none"}}
+                                        onClick={()=>setBracketSwapTarget(isPlayerSwapping?null:{bracketId:bracket.id,mIdx,side,playerId:p.id})}>⇅</span>}
+                                    </span>
+                                  );
+                                })}
                               </span>
+                              {rIdx===0&&isFixedMode&&!bye&&!readOnly&&<span title="Swap this team" style={{cursor:"pointer",fontSize:11,color:champ?C.limeLight:C.gray,padding:"0 2px",userSelect:"none",flexShrink:0}}
+                                onClick={()=>setBracketSwapTarget(teamSwapping?null:{bracketId:bracket.id,mIdx,side,playerId:null})}>⇅</span>}
                               {win&&!bye&&<span style={{fontSize:champ?15:12,flexShrink:0}}>{champ?"🏆":"✓"}</span>}
-                              {bothReal&&!bye&&<input type="number" min="0" key={match.id+sf} style={{border:`1.5px solid ${win?C.lime:C.grayLight}`,borderRadius:6,padding:"5px 0",width:42,textAlign:"center",fontWeight:700,fontSize:15,fontFamily:"inherit",color:win?C.greenDark:C.charcoal,background:win?"#E8F8E0":C.white,outline:"none",flexShrink:0}} defaultValue={match[sf]} onBlur={e=>updateBracketScore(rIdx,mIdx,sf,e.target.value)} placeholder="—"/>}
+                              {bothReal&&!bye&&(readOnly?(
+                                <span style={{border:`1.5px solid ${win?C.lime:C.grayLight}`,borderRadius:6,padding:"5px 0",width:42,textAlign:"center",fontWeight:700,fontSize:15,color:win?C.greenDark:C.charcoal,background:win?"#E8F8E0":C.white,flexShrink:0,display:"inline-block"}}>{match[sf]||"—"}</span>
+                              ):(
+                                <input type="number" min="0" key={match.id+sf} style={{border:`1.5px solid ${win?C.lime:C.grayLight}`,borderRadius:6,padding:"5px 0",width:42,textAlign:"center",fontWeight:700,fontSize:15,fontFamily:"inherit",color:win?C.greenDark:C.charcoal,background:win?"#E8F8E0":C.white,outline:"none",flexShrink:0}} defaultValue={match[sf]} onBlur={e=>updateBracketScore(bracket.id,rIdx,mIdx,sf,e.target.value)} placeholder="—"/>
+                              ))}
                             </div>
+                            {teamSwapping&&(
+                              <div style={{padding:"0 12px 10px",background:bg}}>
+                                {teamAvailable.length>0?(
+                                  <select autoFocus style={{border:`1.5px solid ${C.blue}`,borderRadius:6,padding:"4px 6px",fontSize:12,fontFamily:"inherit",fontWeight:600,color:C.charcoal,background:C.white,cursor:"pointer",outline:"none",width:"100%"}}
+                                    defaultValue="" onChange={e=>{const entry=entryPool.find(x=>x.key===e.target.value);if(entry){swapBracketEntry(bracket.id,mIdx,side,entry);setBracketSwapTarget(null);}}}
+                                    onBlur={()=>setBracketSwapTarget(null)}>
+                                    <option value="" disabled>Swap in…</option>
+                                    {teamAvailable.map(e=><option key={e.key} value={e.key}>{e.name}</option>)}
+                                  </select>
+                                ):<div style={{fontSize:11,color:champ?C.limeLight:C.gray}}>No one else available</div>}
+                              </div>
+                            )}
+                            {!isFixedMode&&rIdx===0&&members.map(p=>{
+                              const isPlayerSwapping=bracketSwapTarget?.bracketId===bracket.id&&bracketSwapTarget?.mIdx===mIdx&&bracketSwapTarget?.side===side&&bracketSwapTarget?.playerId===p.id;
+                              if(!isPlayerSwapping)return null;
+                              const playerAvailable=entryPool.filter(e=>!Array.isArray(e.raw?.players)&&!usedIds.has(e.raw.id));
+                              return(
+                                <div key={p.id} style={{padding:"0 12px 10px",background:bg}}>
+                                  {playerAvailable.length>0?(
+                                    <select autoFocus style={{border:`1.5px solid ${C.blue}`,borderRadius:6,padding:"4px 6px",fontSize:12,fontFamily:"inherit",fontWeight:600,color:C.charcoal,background:C.white,cursor:"pointer",outline:"none",width:"100%"}}
+                                      defaultValue="" onChange={e=>{const entry=entryPool.find(x=>x.key===e.target.value);if(entry){swapBracketPlayer(bracket.id,mIdx,side,p.id,entry);setBracketSwapTarget(null);}}}
+                                      onBlur={()=>setBracketSwapTarget(null)}>
+                                      <option value="" disabled>Swap {p.name} for…</option>
+                                      {playerAvailable.map(e=><option key={e.key} value={e.key}>{e.name}</option>)}
+                                    </select>
+                                  ):<div style={{fontSize:11,color:champ?C.limeLight:C.gray}}>No one else available</div>}
+                                </div>
+                              );
+                            })}
                           </div>
                         );
                       })}
@@ -817,14 +1410,14 @@ export default function FrogTournament(){
     );
   }
 
-  function ChampBanner(){
-    if(!bracketRounds.length)return null;
-    const live=propagateWinners(bracketRounds),fm=live[live.length-1][0],champ=getWinnerTeam(fm);
+  function ChampBanner({bracket}){
+    if(!bracket||!bracket.rounds.length)return null;
+    const live=propagateWinners(bracket.rounds),fm=live[live.length-1][0],champ=getWinnerTeam(fm);
     if(!champ||isBye(champ))return null;
     return(
       <div style={{...S.card,background:`linear-gradient(135deg,${C.greenDark},${C.greenMid})`,textAlign:"center",padding:"28px 20px",border:`3px solid ${C.lime}`,marginBottom:20}}>
         <div style={{fontSize:40,marginBottom:6}}>🏆</div>
-        <div style={{color:C.lime,fontWeight:900,fontSize:22,marginBottom:4}}>Tournament Champions!</div>
+        <div style={{color:C.lime,fontWeight:900,fontSize:22,marginBottom:4}}>{bracket.name} Champions!</div>
         <div style={{color:C.limeLight,fontWeight:800,fontSize:18}}>{champ.map(p=>p?.name).join(" & ")}</div>
         <div style={{color:C.lime,opacity:0.7,fontSize:13,marginTop:6}}>Final: {fm.score1} – {fm.score2}</div>
       </div>
@@ -833,10 +1426,11 @@ export default function FrogTournament(){
 
   // ── Round renderer (reused for both normal RR and pool play)
   function RoundsList({rounds,updateScore,poolIdx=null}){
+    const candidatePlayers=poolIdx!==null?getPool(poolIdx).flat(Infinity):players;
     return rounds.map((round,rIdx)=>{
       const playingIds=new Set();
       round.forEach(m=>[m.team1,m.team2].forEach(t=>{if(Array.isArray(t))t.filter(Boolean).forEach(p=>playingIds.add(p.id));}));
-      const sittingOut=players.filter(p=>!playingIds.has(p.id));
+      const sittingOut=candidatePlayers.filter(p=>!playingIds.has(p.id));
       return(
         <div key={rIdx} style={{marginBottom:20}}>
           <div style={{...S.card,padding:0,overflow:"hidden"}}>
@@ -848,14 +1442,38 @@ export default function FrogTournament(){
               {round.map((match,mIdx)=>{
                 const w=matchWinner(match);
                 return(
-                  <div key={mIdx} style={S.matchCard}>
-                    <RRTeamBlock team={match.team1} side="team1" isWinner={w==="team1"} hasWinner={!!w} rrEditingName={rrEditingName} setRrEditingName={setRrEditingName} saveRrName={saveRrName} players={players} onSwap={swapRRPlayer} swapTarget={swapTarget} setSwapTarget={setSwapTarget} rIdx={rIdx} mIdx={mIdx} poolIdx={poolIdx}/>
-                    <div style={{display:"flex",alignItems:"center",gap:6}}>
-                      <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s1`} defaultValue={match.score1} onBlur={e=>updateScore(rIdx,mIdx,"score1",e.target.value)} placeholder="—"/>
-                      <span style={{fontWeight:900,color:C.gray,fontSize:16}}>vs</span>
-                      <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s2`} defaultValue={match.score2} onBlur={e=>updateScore(rIdx,mIdx,"score2",e.target.value)} placeholder="—"/>
+                  <div key={mIdx}>
+                    {courtsEnabled&&courtLabels.length>0&&(
+                      <div style={{marginBottom:4}}>
+                        {readOnly?(
+                          <span style={{...S.badge(C.grayLight,C.greenDark),fontSize:11}}>🎾 Court {match.court??courtLabels[mIdx%courtLabels.length]}</span>
+                        ):(
+                          <select value={match.court??courtLabels[mIdx%courtLabels.length]} onChange={e=>updateScore(rIdx,mIdx,"court",e.target.value)}
+                            style={{...S.badge(C.grayLight,C.greenDark),fontSize:11,border:"none",cursor:"pointer",fontFamily:"inherit",fontWeight:700,paddingRight:6}}>
+                            {courtLabels.map(c=><option key={c} value={c}>🎾 Court {c}</option>)}
+                          </select>
+                        )}
+                      </div>
+                    )}
+                    <div style={S.matchCard}>
+                      <RRTeamBlock team={match.team1} side="team1" isWinner={w==="team1"} hasWinner={!!w} rrEditingName={rrEditingName} setRrEditingName={setRrEditingName} saveRrName={saveRrName} players={candidatePlayers} onSwap={swapRRPlayer} swapTarget={swapTarget} setSwapTarget={setSwapTarget} rIdx={rIdx} mIdx={mIdx} poolIdx={poolIdx} readOnly={readOnly}/>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        {readOnly?(
+                          <>
+                            <span style={S.scoreInput}>{match.score1||"—"}</span>
+                            <span style={{fontWeight:900,color:C.gray,fontSize:16}}>vs</span>
+                            <span style={S.scoreInput}>{match.score2||"—"}</span>
+                          </>
+                        ):(
+                          <>
+                            <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s1`} defaultValue={match.score1} onBlur={e=>updateScore(rIdx,mIdx,"score1",e.target.value)} placeholder="—"/>
+                            <span style={{fontWeight:900,color:C.gray,fontSize:16}}>vs</span>
+                            <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s2`} defaultValue={match.score2} onBlur={e=>updateScore(rIdx,mIdx,"score2",e.target.value)} placeholder="—"/>
+                          </>
+                        )}
+                      </div>
+                      <RRTeamBlock team={match.team2} side="team2" isWinner={w==="team2"} hasWinner={!!w} rrEditingName={rrEditingName} setRrEditingName={setRrEditingName} saveRrName={saveRrName} players={candidatePlayers} onSwap={swapRRPlayer} swapTarget={swapTarget} setSwapTarget={setSwapTarget} rIdx={rIdx} mIdx={mIdx} poolIdx={poolIdx} readOnly={readOnly}/>
                     </div>
-                    <RRTeamBlock team={match.team2} side="team2" isWinner={w==="team2"} hasWinner={!!w} rrEditingName={rrEditingName} setRrEditingName={setRrEditingName} saveRrName={saveRrName} players={players} onSwap={swapRRPlayer} swapTarget={swapTarget} setSwapTarget={setSwapTarget} rIdx={rIdx} mIdx={mIdx} poolIdx={poolIdx}/>
                   </div>
                 );
               })}
@@ -897,13 +1515,76 @@ export default function FrogTournament(){
           {poolPlay&&<span style={{...S.badge(C.blue),fontSize:13}}>{numPools} Pools</span>}
           {pinnedPairs.length>0&&<span style={{...S.badge(C.amber),fontSize:13}}>{pinnedPairs.length} Pairs</span>}
           {!poolPlay&&rrRounds.length>0&&<span style={{...S.badge(C.blue),fontSize:13}}>{rrRounds.length} Games/Player</span>}
-          {bracketRounds.length>0&&<span style={{...S.badge(C.green),fontSize:13}}>{bracketRounds.length}-Round Bracket</span>}
-          <button style={S.smallBtn("green")} onClick={()=>{setSaveFileName("");setShowSaveModal(true);}}>💾 Save</button>
-          <button style={S.smallBtn("ghost")} onClick={()=>importFileRef.current?.click()}>📂 Import</button>
-          <input ref={importFileRef} type="file" accept="application/json,.json" style={{display:"none"}}
-            onChange={e=>{const f=e.target.files?.[0];if(f)importSave(f);e.target.value="";}}/>
+          {playoffBrackets.length>0&&<span style={{...S.badge(C.green),fontSize:13}}>{playoffBrackets.length} Playoff Bracket{playoffBrackets.length!==1?"s":""}</span>}
+          {joined?(
+            canEditJoined?(
+              <span style={{...S.badge(C.green),fontSize:13,display:"flex",alignItems:"center",gap:6}}>
+                <span style={{width:7,height:7,borderRadius:"50%",background:C.white,display:"inline-block"}}/>
+                ✏️ Editing live
+              </span>
+            ):(
+              <span style={{...S.badge(viewStatus==="live"?C.red:C.gray),fontSize:13,display:"flex",alignItems:"center",gap:6}}>
+                {viewStatus==="live"&&<span style={{width:7,height:7,borderRadius:"50%",background:C.white,display:"inline-block"}}/>}
+                {viewStatus==="connecting"?"Connecting…":viewStatus==="notfound"?"Tournament not found":"Live view"}
+              </span>
+            )
+          ):(
+            <>
+              {liveCode?(
+                <button style={{...S.smallBtn(liveStatus==="error"?"red":"green")}} onClick={()=>setShowLiveModal(true)}>
+                  {liveStatus==="live"?"🔴 Live":liveStatus==="error"?"⚠️ Sync error":"🔴 Going live…"}
+                </button>
+              ):(
+                <button style={S.smallBtn("blue")} onClick={()=>{goLive();setShowLiveModal(true);}}>📡 Go Live</button>
+              )}
+              <button style={S.smallBtn("green")} onClick={()=>{setSaveFileName("");setShowSaveModal(true);}}>💾 Save</button>
+              <button style={S.smallBtn("ghost")} onClick={()=>importFileRef.current?.click()}>📂 Import</button>
+              <input ref={importFileRef} type="file" accept="application/json,.json" style={{display:"none"}}
+                onChange={e=>{const f=e.target.files?.[0];if(f)importSave(f);e.target.value="";}}/>
+            </>
+          )}
         </div>
       </div>
+
+      {joined&&(
+        <div style={{background:canEditJoined?C.green:C.amber,color:C.white,textAlign:"center",padding:"8px 16px",fontWeight:700,fontSize:13}}>
+          {canEditJoined?"✏️ You're editing a live tournament — your changes sync to everyone else in real time.":"👁️ You're viewing a live tournament — read-only. Changes made by the host will appear automatically."}
+          {viewMeta?.updatedAt&&<span style={{fontWeight:500,opacity:0.85}}> · Updated {new Date(viewMeta.updatedAt).toLocaleTimeString()}</span>}
+        </div>
+      )}
+
+      {showLiveModal&&!joined&&(
+        <div style={S.overlay} onClick={()=>setShowLiveModal(false)}>
+          <div style={S.modal} onClick={e=>e.stopPropagation()}>
+            <div style={{fontWeight:800,fontSize:16,color:C.greenDark,marginBottom:6}}>📡 Live tournament</div>
+            <div style={{fontSize:13,color:C.gray,marginBottom:16}}>
+              Anyone with this link can watch scores and standings update live, in real time, from any device.
+            </div>
+            <label style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,cursor:"pointer",fontSize:13,fontWeight:600,color:C.greenDark}}>
+              <input type="checkbox" checked={liveEditable} onChange={e=>setLiveEditable(e.target.checked)}/>
+              ✏️ Let people with this link edit too (not just watch)
+            </label>
+            {(() => {
+              const link=`${window.location.origin}${window.location.pathname}?view=${liveCode}`;
+              return(
+                <>
+                  <div style={{display:"flex",gap:8,marginBottom:8}}>
+                    <input readOnly style={{...S.input,flex:1,boxSizing:"border-box",fontSize:13}} value={link} onFocus={e=>e.target.select()}/>
+                    <button style={S.smallBtn("blue")} onClick={()=>{
+                      navigator.clipboard?.writeText(link).then(()=>{setLinkCopied(true);setTimeout(()=>setLinkCopied(false),2000);});
+                    }}>{linkCopied?"Copied!":"Copy"}</button>
+                  </div>
+                  <div style={{fontSize:12,color:C.gray,marginBottom:16}}>
+                    Status: {liveStatus==="live"?"🟢 Live and syncing":liveStatus==="error"?"⚠️ Couldn't sync — check your connection":"Connecting…"}
+                  </div>
+                </>
+              );
+            })()}
+            <button style={{...S.smallBtn("red"),width:"100%"}} onClick={()=>{stopLive();setShowLiveModal(false);}}>Stop Sharing</button>
+            <button style={{...S.smallBtn("ghost"),marginTop:8,width:"100%",background:C.grayLight}} onClick={()=>setShowLiveModal(false)}>Close</button>
+          </div>
+        </div>
+      )}
 
       {toast&&(
         <div style={{position:"fixed",bottom:20,right:20,zIndex:1200,background:C.greenDark,color:C.white,padding:"10px 18px",borderRadius:10,fontWeight:700,fontSize:14,boxShadow:"0 6px 24px rgba(0,0,0,0.25)"}}>
@@ -936,7 +1617,7 @@ export default function FrogTournament(){
           <div>
             <div style={S.card}>
               <div style={S.sectionTitle}>🐸 Player Roster <span style={{...S.badge(C.greenMid),fontSize:11}}>{players.length} players</span>
-                {confirmingClear?(
+                {!readOnly&&(confirmingClear?(
                   <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
                     <span style={{fontSize:13,color:C.red,fontWeight:700}}>Clear everything?</span>
                     <button style={S.smallBtn("red")} onClick={clearAll}>Yes, clear</button>
@@ -944,9 +1625,10 @@ export default function FrogTournament(){
                   </div>
                 ):(
                   <button style={{...S.smallBtn("red"),marginLeft:"auto",fontSize:13}} onClick={()=>setConfirmingClear(true)}>🗑 Clear All</button>
-                )}
+                ))}
               </div>
 
+              {!readOnly&&<>
               {/* Format toggle */}
               <div style={{marginBottom:16}}>
                 <div style={{fontSize:13,fontWeight:700,color:C.greenDark,marginBottom:6}}>Tournament Format</div>
@@ -956,14 +1638,15 @@ export default function FrogTournament(){
                 </div>
               </div>
 
-              {/* Partner mode */}
+              {/* Match type */}
               <div style={{marginBottom:16}}>
-                <div style={{fontSize:13,fontWeight:700,color:C.greenDark,marginBottom:6}}>Partner Mode</div>
+                <div style={{fontSize:13,fontWeight:700,color:C.greenDark,marginBottom:6}}>Match Type</div>
                 <div style={{display:"flex",borderRadius:8,overflow:"hidden",border:`1.5px solid ${C.grayLight}`,width:"fit-content"}}>
                   <button style={S.modeBtn(rrMode==="rotating")} onClick={()=>setRrMode("rotating")}>🔄 Rotating</button>
                   <button style={S.modeBtn(rrMode==="fixed")} onClick={()=>setRrMode("fixed")}>🔒 Fixed</button>
+                  <button style={S.modeBtn(rrMode==="singles")} onClick={()=>setRrMode("singles")}>🏓 Singles</button>
                 </div>
-                <div style={{fontSize:12,color:C.gray,marginTop:4}}>{rrMode==="rotating"?"New partner each round.":"Same partner throughout."}</div>
+                <div style={{fontSize:12,color:C.gray,marginTop:4}}>{rrMode==="rotating"?"Doubles — new partner each round.":rrMode==="fixed"?"Doubles — same partner throughout.":"Singles — 1 vs 1, no partners."}</div>
               </div>
 
               {/* Must pair (fixed mode) */}
@@ -988,6 +1671,48 @@ export default function FrogTournament(){
                 </div>
               )}
 
+              {/* First-round bye picker (rotating mode, when a team must sit out) */}
+              {!poolPlay&&firstRoundByeInfo.needed>0&&(
+                <div style={{marginBottom:16,padding:"14px 16px",borderRadius:10,background:C.cream,border:`1.5px solid ${C.grayLight}`}}>
+                  <div style={{fontSize:13,fontWeight:800,color:C.greenDark,marginBottom:6}}>😴 Round 1 Bye (optional)</div>
+                  <div style={{fontSize:12,color:C.gray,marginBottom:8}}>With {players.length} players, {firstRoundByeInfo.needed} will sit out Round 1. Pick who (e.g. players running late) or leave blank to randomize.</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                    {firstRoundByeInfo.eligible.map(p=>{
+                      const checked=firstRoundByeIds.includes(p.id);
+                      const disabled=!checked&&firstRoundByeIds.length>=firstRoundByeInfo.needed;
+                      return(
+                        <label key={p.id} style={{display:"flex",alignItems:"center",gap:6,fontSize:13,fontWeight:600,padding:"6px 10px",borderRadius:8,background:checked?"#F0FAE8":C.white,border:`1.5px solid ${checked?C.lime:C.grayLight}`,opacity:disabled?0.5:1,cursor:disabled?"not-allowed":"pointer"}}>
+                          <input type="checkbox" checked={checked} disabled={disabled}
+                            onChange={()=>setFirstRoundByeIds(prev=>checked?prev.filter(id=>id!==p.id):[...prev,p.id])}/>
+                          {p.name||"unnamed"}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Court capacity */}
+              <div style={{marginBottom:16,padding:"14px 16px",borderRadius:10,background:C.cream,border:`1.5px solid ${C.grayLight}`}}>
+                <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontWeight:800,fontSize:13,color:C.greenDark,marginBottom:courtsEnabled?10:0}}>
+                  <input type="checkbox" checked={courtsEnabled} onChange={e=>setCourtsEnabled(e.target.checked)}/>
+                  🎾 Assign courts to matches
+                </label>
+                {courtsEnabled&&(
+                  <>
+                    <div style={{display:"flex",gap:16,flexWrap:"wrap",alignItems:"center",marginBottom:10}}>
+                      <NumSelect value={numCourts} onChange={setNumCourts} label="Number of courts:"/>
+                    </div>
+                    <div style={{marginBottom:8}}>
+                      <input style={{...S.input,fontSize:13,padding:"8px 12px",width:260}} placeholder="Custom court numbers, e.g. 3, 5, 7 (optional)" value={customCourtLabels} onChange={e=>setCustomCourtLabels(e.target.value)}/>
+                    </div>
+                    <div style={{fontSize:12,color:C.gray}}>
+                      Courts: {courtLabels.join(", ")}{poolPlay?" · matches cycle through these courts":` · at most ${courtLabels.length} match${courtLabels.length!==1?"es":""} per round in All Play — extra players sit out and rotate fairly`}
+                    </div>
+                  </>
+                )}
+              </div>
+
               {/* Games per player */}
               <div style={{marginBottom:16}}>
                 <NumSelect value={rrNumRounds} onChange={setRrNumRounds} label="Games per player:"/>
@@ -1007,20 +1732,17 @@ export default function FrogTournament(){
                 </div>
               )}
 
-              {/* Playoff format */}
-              <div style={{marginBottom:20,paddingTop:16,borderTop:`1px solid ${C.grayLight}`}}>
-                <div style={{fontSize:13,fontWeight:700,color:C.greenDark,marginBottom:6}}>Playoff Format</div>
-                <NumSelect value={playoffNumRounds} onChange={setPlayoffNumRounds} label="Playoff rounds:"/>
-                <div style={{fontSize:12,color:C.gray,marginTop:4}}>{playoffNumRounds===1?"Finals only":playoffNumRounds===2?"Semis + Finals":playoffNumRounds===3?"Quarters + Semis + Finals":`${playoffNumRounds} rounds`}</div>
-              </div>
+              {/* Playoff format is configured from the Playoffs tab once standings exist */}
+              </>}
 
               {/* Player list */}
-              {players.map(p=>{
+              {players.map((p,idx)=>{
                 const partner=p.pinnedPartnerId?players.find(q=>q.id===p.pinnedPartnerId):null;
                 return(
                   <div key={p.id} style={S.playerRow(!!p.pinnedPartnerId)}>
+                    <span style={{fontSize:13,fontWeight:700,color:C.gray,minWidth:20}}>{idx+1}.</span>
                     <span style={{fontSize:18}}>{p.pinnedPartnerId?"📌":"👤"}</span>
-                    {editingPlayer?.id===p.id?(
+                    {!readOnly&&editingPlayer?.id===p.id?(
                       <>
                         <input style={{...S.input,flex:1,marginRight:6}} value={editingPlayer.name} onChange={e=>setEditingPlayer({...editingPlayer,name:e.target.value})} onKeyDown={e=>e.key==="Enter"&&saveEditPlayer(p.id,editingPlayer.name)} autoFocus/>
                         <button style={S.smallBtn("green")} onClick={()=>saveEditPlayer(p.id,editingPlayer.name)}>Save</button>
@@ -1033,16 +1755,18 @@ export default function FrogTournament(){
                           {partner&&<div style={{fontSize:11,color:C.greenMid,fontWeight:700}}>with {partner.name}</div>}
                           {poolPlay&&poolAssignments[unitKey(p)]!==undefined&&<span style={{...S.badge(C.poolColors[poolAssignments[unitKey(p)]%C.poolColors.length]),fontSize:10,marginTop:2}}>Pool {poolAssignments[unitKey(p)]+1}</span>}
                         </div>
-                        <button style={S.iconBtn(p.pinnedPartnerId?C.amber:C.gray)} onClick={()=>setPinningPlayerId(p.id)}>📌</button>
-                        <button style={S.iconBtn(C.greenMid)} onClick={()=>setEditingPlayer({id:p.id,name:p.name})}>✏️</button>
-                        <button style={S.iconBtn(C.red)} onClick={()=>removePlayer(p.id)}>✕</button>
+                        {!readOnly&&<>
+                          <button style={S.iconBtn(p.pinnedPartnerId?C.amber:C.gray)} onClick={()=>setPinningPlayerId(p.id)}>📌</button>
+                          <button style={S.iconBtn(C.greenMid)} onClick={()=>setEditingPlayer({id:p.id,name:p.name})}>✏️</button>
+                          <button style={S.iconBtn(C.red)} onClick={()=>removePlayer(p.id)}>✕</button>
+                        </>}
                       </>
                     )}
                   </div>
                 );
               })}
 
-              {addingPlayer?(
+              {!readOnly&&(addingPlayer?(
                 <div style={{display:"flex",gap:8,marginTop:10}}>
                   <input style={{...S.input,flex:1}} placeholder="Player name..." value={newPlayerName} onChange={e=>setNewPlayerName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPlayer()} autoFocus/>
                   <button style={S.smallBtn("green")} onClick={addPlayer}>Add</button>
@@ -1050,21 +1774,21 @@ export default function FrogTournament(){
                 </div>
               ):(
                 <button style={{...S.bigBtn("lime"),marginTop:10,fontSize:13}} onClick={()=>setAddingPlayer(true)}>+ Add Player</button>
-              )}
+              ))}
             </div>
 
-            <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+            {!readOnly&&<div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
               {poolPlay?(
-                <button style={S.bigBtn("blue")} onClick={()=>setTab(1)} disabled={players.length<4}>
+                <button style={S.bigBtn("blue")} onClick={()=>setTab(1)} disabled={players.length<minPlayers}>
                   Next: Set Up Pools →
                 </button>
               ):(
-                <button style={S.bigBtn("blue")} onClick={generateRR} disabled={players.length<4}>
-                  🎲 Generate All Play Schedule
+                <button style={S.bigBtn("blue")} onClick={generateRR} disabled={players.length<minPlayers}>
+                  🎲 Generate {rrMode==="singles"?"Singles":"All Play"} Schedule
                 </button>
               )}
-              {players.length<4&&<span style={{color:C.limeLight,fontSize:13,alignSelf:"center"}}>Need at least 4 players</span>}
-            </div>
+              {players.length<minPlayers&&<span style={{color:C.limeLight,fontSize:13,alignSelf:"center"}}>Need at least {minPlayers} players</span>}
+            </div>}
           </div>
         )}
 
@@ -1077,10 +1801,10 @@ export default function FrogTournament(){
                 <span style={{...S.badge(C.greenMid),fontSize:11}}>{poolUnits.length} {rrMode==="fixed"?"teams":"players"}</span>
               </div>
 
-              <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+              {!readOnly&&<div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
                 <button style={S.bigBtn("lime")} onClick={autoAssignAllPools}>🎲 Auto-assign pools</button>
                 <button style={S.smallBtn("ghost")} onClick={()=>setPoolAssignments({})}>Reset assignments</button>
-              </div>
+              </div>}
 
               {/* Warnings */}
               {Array.from({length:numPools},(_,p)=>getPool(p)).some(pool=>pool.length<2)&&(
@@ -1111,7 +1835,7 @@ export default function FrogTournament(){
                             <span style={{flex:1,fontSize:13,fontWeight:inPool?700:500}}>{name}</span>
                             {inPool?(
                               <span style={{...S.badge(C.lime,C.greenDark),fontSize:10}}>✓ Here</span>
-                            ):(
+                            ):!readOnly&&(
                               <button style={S.smallBtn("green")} onClick={()=>setUnitPool(u,poolIdx)}>Move here</button>
                             )}
                           </div>
@@ -1123,9 +1847,9 @@ export default function FrogTournament(){
               </div>
             </div>
 
-            <button style={S.bigBtn("blue")} onClick={generatePoolPlay}>
+            {!readOnly&&<button style={S.bigBtn("blue")} onClick={generatePoolPlay}>
               🎲 Generate Pool Schedules →
-            </button>
+            </button>}
           </div>
         )}
 
@@ -1136,7 +1860,8 @@ export default function FrogTournament(){
               // Pool play mode — show each pool separately
               <>
                 <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
-                  <button style={S.bigBtn("lime")} onClick={generatePoolPlay}>🔀 Re-generate pools</button>
+                  {!readOnly&&<button style={S.bigBtn("lime")} onClick={generatePoolPlay}>🔀 Re-generate pools</button>}
+                  {!readOnly&&<button style={S.bigBtn("dark")} onClick={addRound} title="Add another round to every pool, keeping the rounds already played">➕ Add Round</button>}
                   <button style={S.bigBtn("blue")} onClick={()=>setTab(standingsTabIdx)}>📊 Pool Standings →</button>
                 </div>
                 {Array.from({length:numPools},(_,poolIdx)=>{
@@ -1170,9 +1895,10 @@ export default function FrogTournament(){
                 </div>
               ):(
                 <>
-                  <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+                  {!readOnly&&<div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
                     <button style={S.bigBtn("lime")} onClick={generateRR}>🔀 Re-randomize</button>
-                    <button style={S.bigBtn("blue")} onClick={generatePlayoffs}>🏆 Generate Playoffs →</button>
+                    <button style={S.bigBtn("dark")} onClick={addRound} title="Add another round, keeping the rounds already played">➕ Add Round</button>
+                    <button style={S.bigBtn("blue")} onClick={()=>{setConfiguringPlayoffs(true);setTab(playoffsTabIdx);}}>🏆 Set Up Playoffs →</button>
                     {addingPlayer?(
                       <div style={{display:"flex",gap:8,alignItems:"center"}}>
                         <input style={{...S.input,width:160}} placeholder="Name..." value={newPlayerName} onChange={e=>setNewPlayerName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPlayer()} autoFocus/>
@@ -1182,7 +1908,7 @@ export default function FrogTournament(){
                     ):(
                       <button style={S.smallBtn("lime")} onClick={()=>setAddingPlayer(true)}>+ Add Player</button>
                     )}
-                  </div>
+                  </div>}
                   <RoundsList rounds={rrRounds} updateScore={updateRRScore}/>
                 </>
               )
@@ -1211,70 +1937,176 @@ export default function FrogTournament(){
                     </div>
                   );
                 })}
-                <div style={{display:"flex",gap:10,marginTop:4,flexWrap:"wrap"}}>
-                  {rrMode==="rotating"&&(
-                    <div style={{...S.card,flex:1,minWidth:260}}>
-                      <div style={{fontWeight:700,fontSize:13,color:C.greenDark,marginBottom:8}}>Playoff Pairing Mode</div>
-                      {["best-worst","1-2"].map(mode=>(
-                        <label key={mode} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,cursor:"pointer"}}>
-                          <input type="radio" name="pairingMode" checked={playoffPairingMode===mode} onChange={()=>setPlayoffPairingMode(mode)}/>
-                          <span style={{fontSize:13}}>{mode==="best-worst"?"Best with worst (#1 & #last)":"Sequential (#1 & #2, #3 & #4…)"}</span>
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                  <button style={S.bigBtn("blue")} onClick={generatePoolPlayoffs}>🏆 Generate Playoff Bracket →</button>
-                </div>
+                {!readOnly&&<div style={{display:"flex",gap:10,marginTop:4,flexWrap:"wrap"}}>
+                  <button style={S.bigBtn("blue")} onClick={()=>{setConfiguringPlayoffs(true);setTab(playoffsTabIdx);}}>🏆 Set Up Playoffs →</button>
+                </div>}
               </>
             ):(
               // Normal standings
               <div>
                 <div style={S.card}>
-                  <div style={S.sectionTitle}>📊 Standings <span style={{fontSize:12,color:C.gray,fontWeight:400}}>Wins → point differential</span></div>
+                  <div style={S.sectionTitle}>📊 Standings <span style={{fontSize:12,color:C.gray,fontWeight:400}}>Win % → avg point differential per game</span></div>
                   <div style={{overflowX:"auto"}}>
                     <StandingsTable entries={standings} mode={rrMode} showQualify={false} poolIdx={null}/>
                   </div>
                 </div>
-                <button style={S.bigBtn("blue")} onClick={generatePlayoffs}>🏆 Generate Playoff Bracket →</button>
+                {!readOnly&&<button style={S.bigBtn("blue")} onClick={()=>{setConfiguringPlayoffs(true);setTab(playoffsTabIdx);}}>🏆 Set Up Playoffs →</button>}
               </div>
             )}
           </div>
         )}
 
         {/* ══ PLAYOFFS TAB ══ */}
-        {tab===playoffsTabIdx&&(
-          <div>
-            {bracketRounds.length===0?(
+        {tab===playoffsTabIdx&&(()=>{
+          const showSetup=configuringPlayoffs||playoffBrackets.length===0;
+          const entryPool=showSetup?getPlayoffEntryPool():[];
+          if(showSetup&&entryPool.length<2){
+            return(
               <div style={{...S.card,textAlign:"center",padding:40}}>
                 <div style={{fontSize:40,marginBottom:10}}>🏆</div>
                 <div style={{fontWeight:700,color:C.greenDark,fontSize:16,marginBottom:6}}>Playoffs not started</div>
-                <div style={{color:C.gray,fontSize:14,marginBottom:16}}>Complete {poolPlay?"pool play":"round robin"} scores then generate the bracket from Standings.</div>
-                <button style={S.bigBtn("lime")} onClick={()=>setTab(standingsTabIdx)}>← View Standings</button>
+                <div style={{color:C.gray,fontSize:14,marginBottom:16}}>Complete {poolPlay?"pool play":"round robin"} scores then set up the bracket from Standings.</div>
+                <button style={S.bigBtn("lime")} onClick={()=>{setConfiguringPlayoffs(false);setTab(standingsTabIdx);}}>← View Standings</button>
               </div>
-            ):(
-              <>
-                <ChampBanner/>
-                <div style={{...S.card,padding:"14px 18px",marginBottom:16}}>
-                  <div style={{display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}}>
-                    <div style={{display:"flex",alignItems:"center",gap:10}}>
-                      <span style={{fontSize:13,fontWeight:700,color:C.greenDark}}>Playoff rounds:</span>
-                      <input type="number" min="1" style={{...S.numSelect,width:70}} value={playoffNumRounds} onChange={e=>setPlayoffNumRounds(Math.max(1,parseInt(e.target.value)||1))}/>
+            );
+          }
+          if(showSetup&&readOnly){
+            return(
+              <div style={{...S.card,textAlign:"center",padding:40}}>
+                <div style={{fontSize:40,marginBottom:10}}>🏆</div>
+                <div style={{fontWeight:700,color:C.greenDark,fontSize:16,marginBottom:6}}>Playoffs haven't started yet</div>
+                <div style={{color:C.gray,fontSize:14}}>The host hasn't set up the playoff bracket yet. Check back soon.</div>
+              </div>
+            );
+          }
+          if(showSetup){
+            const perBracketPreview=splitEntriesIntoBrackets(entryPool,numPlayoffBrackets,bracketAssignmentOverrides);
+            const effectiveAssignment={};
+            perBracketPreview.forEach((bucket,i)=>bucket.forEach(e=>{effectiveAssignment[e.key]=i;}));
+            return(
+              <div>
+                <div style={S.card}>
+                  <div style={S.sectionTitle}>🏆 Playoff Setup
+                    <span style={{...S.badge(C.blue),fontSize:11}}>{numPlayoffBrackets} bracket{numPlayoffBrackets!==1?"s":""}</span>
+                    <span style={{...S.badge(C.greenMid),fontSize:11}}>{entryPool.length} {rrMode==="fixed"?"teams":"players"}</span>
+                  </div>
+
+                  <div style={{display:"flex",gap:16,flexWrap:"wrap",alignItems:"center",marginBottom:16}}>
+                    <NumSelect value={numPlayoffBrackets} onChange={setNumPlayoffBrackets} label="Number of playoff brackets:"/>
+                    <button style={S.smallBtn("ghost")} onClick={()=>setBracketAssignmentOverrides({})}>🎲 Reset to auto-split</button>
+                  </div>
+
+                  {rrMode==="rotating"&&(
+                    <div style={{marginBottom:16}}>
+                      <div style={{fontWeight:700,fontSize:13,color:C.greenDark,marginBottom:8}}>Pairing mode (within each bracket)</div>
+                      <div style={{display:"flex",gap:16,flexWrap:"wrap"}}>
+                        {["best-worst","1-2"].map(mode=>(
+                          <label key={mode} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+                            <input type="radio" name="pairingMode" checked={playoffPairingMode===mode} onChange={()=>setPlayoffPairingMode(mode)}/>
+                            <span style={{fontSize:13}}>{mode==="best-worst"?"Best with worst (#1 & #last)":"Sequential (#1 & #2, #3 & #4…)"}</span>
+                          </label>
+                        ))}
+                      </div>
                     </div>
-                    <button style={S.bigBtn("blue")} onClick={poolPlay?generatePoolPlayoffs:generatePlayoffs}>🔄 Regenerate</button>
-                    <button style={S.bigBtn("dark")} onClick={()=>setTab(standingsTabIdx)}>← Standings</button>
+                  )}
+
+                  <div style={{fontSize:12,color:C.gray,marginBottom:10}}>Entries default to an even split by rank — use "Move here" to put specific {rrMode==="fixed"?"teams":"players"} in a different bracket, or exclude someone from playoffs entirely.</div>
+                  <div style={{display:"grid",gridTemplateColumns:`repeat(${Math.min(numPlayoffBrackets+1,4)},1fr)`,gap:14}}>
+                    {Array.from({length:numPlayoffBrackets},(_,bIdx)=>{
+                      const bucket=perBracketPreview[bIdx]||[];
+                      const color=C.poolColors[bIdx%C.poolColors.length];
+                      return(
+                        <div key={bIdx} style={{borderRadius:10,overflow:"hidden",border:`2px solid ${color}`}}>
+                          <div style={{background:color,padding:"8px 14px",fontWeight:800,fontSize:14,color:C.white}}>
+                            {playoffBrackets[bIdx]?.name??defaultBracketName(bIdx)} <span style={{fontWeight:400,fontSize:12,opacity:0.85}}>({bucket.length} · {autoRoundsForCount(bracketTeamCount(bucket.length))}-round)</span>
+                          </div>
+                          <div style={{padding:10,background:C.white,maxHeight:360,overflowY:"auto"}}>
+                            {entryPool.map(e=>{
+                              const inBracket=effectiveAssignment[e.key]===bIdx;
+                              return(
+                                <div key={e.key} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",borderRadius:7,marginBottom:4,background:inBracket?"#F0FAE8":C.cream,border:`1.5px solid ${inBracket?C.lime:C.grayLight}`}}>
+                                  <span style={{flex:1,fontSize:13,fontWeight:inBracket?700:500}}>{e.name}</span>
+                                  {inBracket?(
+                                    <span style={{...S.badge(C.lime,C.greenDark),fontSize:10}}>✓ Here</span>
+                                  ):(
+                                    <button style={S.smallBtn("green")} onClick={()=>setBracketAssignmentOverrides(prev=>({...prev,[e.key]:bIdx}))}>Move here</button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div style={{borderRadius:10,overflow:"hidden",border:`2px solid ${C.gray}`}}>
+                      <div style={{background:C.gray,padding:"8px 14px",fontWeight:800,fontSize:14,color:C.white}}>
+                        Not in Playoffs
+                      </div>
+                      <div style={{padding:10,background:C.white,maxHeight:360,overflowY:"auto"}}>
+                        {entryPool.map(e=>{
+                          const excluded=effectiveAssignment[e.key]===undefined;
+                          return(
+                            <div key={e.key} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",borderRadius:7,marginBottom:4,background:excluded?"#F3F3F3":C.cream,border:`1.5px solid ${excluded?C.gray:C.grayLight}`}}>
+                              <span style={{flex:1,fontSize:13,fontWeight:excluded?700:500}}>{e.name}</span>
+                              {excluded?(
+                                <span style={{...S.badge(C.gray),fontSize:10}}>✓ Excluded</span>
+                              ):(
+                                <button style={S.smallBtn("ghost")} onClick={()=>setBracketAssignmentOverrides(prev=>({...prev,[e.key]:-1}))}>Exclude</button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 </div>
-                <div style={{...S.card,background:`linear-gradient(160deg,${C.greenDark} 0%,#1e3a24 100%)`,padding:"20px 16px"}}>
-                  <div style={{color:C.lime,fontWeight:900,fontSize:18,marginBottom:16,letterSpacing:0.5}}>
-                    🏆 Tournament Bracket
-                    <span style={{fontSize:13,fontWeight:500,color:C.limeLight,marginLeft:12}}>Enter scores to advance winners →</span>
-                  </div>
-                  <BracketView/>
+
+                <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                  <button style={S.bigBtn("blue")} onClick={generateAllPlayoffBrackets}>🏆 Generate All Brackets →</button>
+                  {playoffBrackets.length>0&&<button style={S.bigBtn("dark")} onClick={()=>setConfiguringPlayoffs(false)}>Cancel</button>}
                 </div>
-              </>
-            )}
-          </div>
-        )}
+              </div>
+            );
+          }
+          const activeIdx=Math.min(activeBracketIdx,playoffBrackets.length-1);
+          const activeBracket=playoffBrackets[activeIdx];
+          return(
+            <div>
+              <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+                {playoffBrackets.map((b,i)=>(
+                  editingBracketName?.idx===i?(
+                    <input key={b.id} autoFocus style={{...S.input,width:150,padding:"8px 10px",fontSize:13}}
+                      value={editingBracketName.value}
+                      onChange={e=>setEditingBracketName({idx:i,value:e.target.value})}
+                      onKeyDown={e=>{if(e.key==="Enter"){renamePlayoffBracket(i,editingBracketName.value.trim()||b.name);setEditingBracketName(null);}if(e.key==="Escape")setEditingBracketName(null);}}
+                      onBlur={()=>{renamePlayoffBracket(i,editingBracketName.value.trim()||b.name);setEditingBracketName(null);}}/>
+                  ):(
+                    <button key={b.id} style={S.modeBtn(activeIdx===i)} onClick={()=>setActiveBracketIdx(i)} onDoubleClick={readOnly?undefined:()=>setEditingBracketName({idx:i,value:b.name})}>{b.name}</button>
+                  )
+                ))}
+                {!readOnly&&<>
+                  <button style={S.smallBtn("ghost")} onClick={()=>setEditingBracketName({idx:activeIdx,value:activeBracket.name})}>✏️ Rename</button>
+                  <button style={S.smallBtn("ghost")} onClick={()=>setConfiguringPlayoffs(true)}>⚙️ Reconfigure</button>
+                </>}
+              </div>
+
+              <ChampBanner bracket={activeBracket}/>
+              <div style={{...S.card,padding:"14px 18px",marginBottom:16}}>
+                <div style={{display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{fontSize:13,color:C.gray}}>{activeBracket.rounds[0]?.length||0} match{activeBracket.rounds[0]?.length!==1?"es":""} in Round 1{!readOnly&&" · double-click a bracket's name above to rename it"}</span>
+                  <button style={S.bigBtn("dark")} onClick={()=>setTab(standingsTabIdx)}>← Standings</button>
+                </div>
+              </div>
+              <div style={{...S.card,background:`linear-gradient(160deg,${C.greenDark} 0%,#1e3a24 100%)`,padding:"20px 16px"}}>
+                <div style={{color:C.lime,fontWeight:900,fontSize:18,marginBottom:16,letterSpacing:0.5}}>
+                  🏆 {activeBracket.name}
+                  <span style={{fontSize:13,fontWeight:500,color:C.limeLight,marginLeft:12}}>Enter scores to advance winners · ⇅ to swap a Round 1 {rrMode==="fixed"?"team":"player"} →</span>
+                </div>
+                <BracketView bracket={activeBracket}/>
+              </div>
+            </div>
+          );
+        })()}
 
       </div>
     </div>
