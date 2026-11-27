@@ -321,47 +321,65 @@ function nextLadderRound(rounds,players,mode,matchLimit,courtLabels){
     return{c:lc!=null?lc:Infinity,o:1};
   };
 
-  // Bench whoever has sat out the fewest times when there are more players than spots.
-  let toBench=total-courts*perCourt;
-  const benched=new Set();
-  if(toBench>0){
-    const unitSat=u=>Math.min(...u.members.map(p=>history.sat[p.id]||0));
-    for(const u of shuffle(units).sort((a,b)=>unitSat(a)-unitSat(b))){
-      if(toBench<=0)break;
-      if(u.members.length<=toBench){benched.add(u);toBench-=u.members.length;}
-    }
-  }
-  const queue=units.filter(u=>!benched.has(u)).map(u=>({u,...target(u),r:Math.random()}))
-    .sort((a,b)=>a.c-b.c||a.o-b.o||a.r-b.r).map(x=>x.u);
-
-  // Fill courts top-down in ladder order.
-  const courtUnits=[];let cur=[],curSize=0;
-  while(queue.length&&courtUnits.length<courts){
-    const room=perCourt-curSize;
-    const idx=queue.findIndex(u=>u.members.length<=room);
-    if(idx===-1)break;
-    const u=queue.splice(idx,1)[0];cur.push(u);curSize+=u.members.length;
-    if(curSize===perCourt){courtUnits.push(cur);cur=[];curSize=0;}
-  }
-
+  const unitSat=u=>Math.min(...u.members.map(p=>history.sat[p.id]||0));
   const partnered=(a,b)=>history.partnered[pairKey(a.id,b.id)]||0;
+  // A partnership that has already happened costs far more than anything else, so a repeat
+  // only appears when every option open to the ladder has one; repeating the same pair a
+  // third time costs more again. Facing the same opponents is the minor tie-breaker.
+  const teamCost=t=>{if(t.length<2)return 0;const n=partnered(t[0],t[1]);return n?1000*n*n:0;};
   const opposed=(t1,t2)=>t1.reduce((s,a)=>s+t2.reduce((s2,b)=>s2+(history.opposed[pairKey(a.id,b.id)]||0),0),0);
-  const matches=courtUnits.map(cu=>{
-    let t1,t2;
-    if(teamSize===1){t1=cu[0].members;t2=cu[1].members;}
-    else{
-      const whole=cu.find(u=>u.members.length===2);
-      if(whole){t1=whole.members;t2=cu.filter(u=>u!==whole).flatMap(u=>u.members);}
-      else{
-        // Four loose players: pick the split with the fewest repeat partners (then opponents).
-        const[a,b,c,d]=cu.map(u=>u.members[0]);
-        const options=shuffle([[[a,b],[c,d]],[[a,c],[b,d]],[[a,d],[b,c]]]);
-        const cost=([x,y])=>(partnered(x[0],x[1])+partnered(y[0],y[1]))*100+opposed(x,y);
-        [t1,t2]=options.reduce((best,o)=>cost(o)<cost(best)?o:best,options[0]);
+  const matchCost=(t1,t2)=>teamCost(t1)+teamCost(t2)+opposed(t1,t2);
+
+  // One candidate round. Ties (who sits out among those with equal sit-outs, and the order
+  // of players headed for the same court) are broken at random, so trying several candidates
+  // and keeping the cheapest finds the version with the fewest repeat partners the ladder
+  // rules allow, without ever bending who moves up or down.
+  function candidate(){
+    // Bench whoever has sat out the fewest times when there are more players than spots.
+    let toBench=total-courts*perCourt;
+    const benched=new Set();
+    if(toBench>0){
+      for(const u of shuffle(units).sort((a,b)=>unitSat(a)-unitSat(b))){
+        if(toBench<=0)break;
+        if(u.members.length<=toBench){benched.add(u);toBench-=u.members.length;}
       }
     }
-    return{team1:t1,team2:t2,score1:"",score2:""};
-  });
+    const queue=units.filter(u=>!benched.has(u)).map(u=>({u,...target(u),r:Math.random()}))
+      .sort((a,b)=>a.c-b.c||a.o-b.o||a.r-b.r).map(x=>x.u);
+
+    // Fill courts top-down in ladder order.
+    const courtUnits=[];let cur=[],curSize=0;
+    while(queue.length&&courtUnits.length<courts){
+      const room=perCourt-curSize;
+      const idx=queue.findIndex(u=>u.members.length<=room);
+      if(idx===-1)break;
+      const u=queue.splice(idx,1)[0];cur.push(u);curSize+=u.members.length;
+      if(curSize===perCourt){courtUnits.push(cur);cur=[];curSize=0;}
+    }
+
+    let cost=0;
+    const matches=courtUnits.map(cu=>{
+      let t1,t2;
+      if(teamSize===1){t1=cu[0].members;t2=cu[1].members;}
+      else{
+        const whole=cu.find(u=>u.members.length===2);
+        if(whole){t1=whole.members;t2=cu.filter(u=>u!==whole).flatMap(u=>u.members);}
+        else{
+          // Four loose players: of the three ways to split them, take the one with the
+          // fewest repeat partners (then the fewest repeat opponents).
+          const[a,b,c,d]=cu.map(u=>u.members[0]);
+          const options=shuffle([[[a,b],[c,d]],[[a,c],[b,d]],[[a,d],[b,c]]]);
+          [t1,t2]=options.reduce((best,o)=>matchCost(...o)<matchCost(...best)?o:best,options[0]);
+        }
+      }
+      cost+=matchCost(t1,t2);
+      return{team1:t1,team2:t2,score1:"",score2:""};
+    });
+    return{matches,cost};
+  }
+  let best=candidate();
+  for(let i=0;i<60&&best.cost>0;i++){const c=candidate();if(c.cost<best.cost)best=c;}
+  const matches=best.matches;
   return labelLadderCourts(matches,courtLabels);
 }
 
