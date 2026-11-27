@@ -660,6 +660,8 @@ export default function FrogTournament(){
   const [addingPlayer,setAddingPlayer]=useState(false);
   const [newPlayerName,setNewPlayerName]=useState("");
   const [pinningPlayerId,setPinningPlayerId]=useState(null);
+  // A start action waiting on the "not everyone is checked in" warning (null when none).
+  const [pendingStart,setPendingStart]=useState(null);
   const [rrEditingName,setRrEditingName]=useState(null);
   const [swapTarget,setSwapTarget]=useState(null);
   const [firstRoundByeIds,setFirstRoundByeIds]=useState([]);
@@ -1224,6 +1226,19 @@ export default function FrogTournament(){
     }
   }
 
+  // Check-in lives on the player record, so it saves locally and syncs through Go Live like
+  // everything else about the roster.
+  function toggleCheckIn(id){setPlayers(prev=>prev.map(p=>p.id===id?{...p,checkedIn:!p.checkedIn}:p));}
+  function setAllCheckedIn(v){setPlayers(prev=>prev.map(p=>({...p,checkedIn:v})));}
+  // Starting play with anyone not checked in asks first, but never blocks the start.
+  function confirmStart(action){ // action: "rr" | "pool"
+    if(players.some(p=>!p.checkedIn))setPendingStart(action);
+    else runStart(action);
+  }
+  function runStart(action){
+    if(action==="pool")generatePoolPlay();else generateRR();
+  }
+
   function removePlayer(id){setPlayers(prev=>prev.filter(p=>p.id!==id).map(p=>p.pinnedPartnerId===id?{...p,pinnedPartnerId:null}:p));}
 
   // A player's name gets copied into every match a schedule was generated for (team1/team2
@@ -1384,6 +1399,27 @@ export default function FrogTournament(){
           ))}
           {pp.pinnedPartnerId&&<button style={{...S.smallBtn("red"),marginTop:8,width:"100%"}} onClick={()=>{unpinPlayer(pinningPlayerId);setPinningPlayerId(null);}}>🔓 Unpin</button>}
           <button style={{...S.smallBtn("ghost"),marginTop:8,width:"100%",background:C.grayLight}} onClick={()=>setPinningPlayerId(null)}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Check-in warning shown before play starts with players not checked in
+  function CheckInWarningModal(){
+    const missing=players.filter(p=>!p.checkedIn);
+    const cancel=()=>setPendingStart(null);
+    return(
+      <div style={S.overlay} onClick={cancel}>
+        <div style={S.modal} onClick={e=>e.stopPropagation()}>
+          <div style={{fontWeight:800,fontSize:16,color:C.greenDark,marginBottom:6}}>⚠️ Not everyone is checked in</div>
+          <div style={{fontSize:13,color:C.gray,marginBottom:12}}>{missing.length} of {players.length} {players.length===1?"player hasn't":"players haven't"} checked in yet. They'll still be put on the schedule if you start now.</div>
+          <div style={{maxHeight:220,overflowY:"auto",marginBottom:12}}>
+            {missing.map(p=>(
+              <div key={p.id} style={{padding:"8px 12px",borderRadius:8,marginBottom:6,background:C.cream,border:`1.5px solid ${C.grayLight}`,fontWeight:600,fontSize:14}}>⬜ {p.name||"unnamed"}</div>
+            ))}
+          </div>
+          <button style={{...S.smallBtn("green"),width:"100%"}} onClick={()=>{const a=pendingStart;setPendingStart(null);if(a)runStart(a);}}>Start anyway</button>
+          <button style={{...S.smallBtn("ghost"),marginTop:8,width:"100%",background:C.grayLight}} onClick={cancel}>Cancel</button>
         </div>
       </div>
     );
@@ -1679,6 +1715,7 @@ export default function FrogTournament(){
   return(
     <div style={S.app}>
       {pinningPlayerId&&<PinModal/>}
+      {pendingStart&&<CheckInWarningModal/>}
 
       {/* Header */}
       <div style={S.header}>
@@ -1932,11 +1969,24 @@ export default function FrogTournament(){
               </>}
 
               {/* Player list */}
+              {players.length>0&&(()=>{
+                const inCount=players.filter(p=>p.checkedIn).length;
+                const all=inCount===players.length;
+                return(
+                  <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:10}}>
+                    <span style={{fontSize:13,fontWeight:700,color:all?C.greenMid:C.greenDark}}>✅ Checked in: {inCount} / {players.length}</span>
+                    {!readOnly&&<button style={S.smallBtn("ghost")} onClick={()=>setAllCheckedIn(!all)}>{all?"Clear all":"Check in all"}</button>}
+                  </div>
+                );
+              })()}
               {players.map((p,idx)=>{
                 const partner=p.pinnedPartnerId?players.find(q=>q.id===p.pinnedPartnerId):null;
                 return(
                   <div key={p.id} style={S.playerRow(!!p.pinnedPartnerId)}>
                     <span style={{fontSize:13,fontWeight:700,color:C.gray,minWidth:20}}>{idx+1}.</span>
+                    <button style={{...S.iconBtn(C.greenMid),fontSize:22,padding:"2px 4px",cursor:readOnly?"default":"pointer"}} disabled={readOnly}
+                      title={p.checkedIn?"Checked in (tap to undo)":"Not checked in (tap to check in)"} aria-label={p.checkedIn?`Undo check-in for ${p.name}`:`Check in ${p.name}`}
+                      onClick={()=>!readOnly&&toggleCheckIn(p.id)}>{p.checkedIn?"✅":"⬜"}</button>
                     <span style={{fontSize:18}}>{p.pinnedPartnerId?"📌":"👤"}</span>
                     {!readOnly&&editingPlayer?.id===p.id?(
                       <>
@@ -1979,7 +2029,7 @@ export default function FrogTournament(){
                   Next: Set Up Pools →
                 </button>
               ):(
-                <button style={S.bigBtn("blue")} onClick={generateRR} disabled={players.length<minPlayers}>
+                <button style={S.bigBtn("blue")} onClick={()=>confirmStart("rr")} disabled={players.length<minPlayers}>
                   {isLadder?"🪜 Start Ladder":`🎲 Generate ${rrMode==="singles"?"Singles":"All Play"} Schedule`}
                 </button>
               )}
@@ -2043,7 +2093,7 @@ export default function FrogTournament(){
               </div>
             </div>
 
-            {!readOnly&&<button style={S.bigBtn("blue")} onClick={generatePoolPlay}>
+            {!readOnly&&<button style={S.bigBtn("blue")} onClick={()=>confirmStart("pool")}>
               🎲 Generate Pool Schedules →
             </button>}
           </div>
