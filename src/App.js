@@ -277,6 +277,94 @@ function appendRoundRobinRounds(existingRounds,players,mode,count,matchLimit){
   return buildRounds(units,teamSize,count,matchLimit,historyFromRounds(existingRounds,players),null);
 }
 
+// ─── Ladder ───────────────────────────────────────────────────────────────────
+// A ladder plays one round at a time. Matches in a round are ordered top court first; when
+// every game in the round has a result, winners move up one court and losers move down one
+// (winners on the top court stay, losers on the bottom court stay). In doubles with rotating
+// partners, the two players arriving together on a court are split up so everyone gets a new
+// partner. Players who sat out come back in at the court they last played on (new arrivals
+// start at the bottom), and whoever has sat out least is benched when there are more players
+// than court spots.
+function roundComplete(round){return Array.isArray(round)&&round.length>0&&round.every(m=>matchWinner(m)!==null);}
+function roundHasScores(round){return(round||[]).some(m=>String(m.score1??"")!==""||String(m.score2??"")!=="");}
+function ladderCourtLabel(i,courtLabels){return courtLabels&&courtLabels.length?courtLabels[i%courtLabels.length]:String(i+1);}
+function labelLadderCourts(round,courtLabels){return round.map((m,i)=>({...m,court:ladderCourtLabel(i,courtLabels)}));}
+
+function generateLadderFirstRound(players,mode,firstRoundByeIds,matchLimit,courtLabels){
+  const r=generateRoundRobinRounds(players,mode,1,firstRoundByeIds,matchLimit);
+  return r.length&&r[0].length?[labelLadderCourts(r[0],courtLabels)]:[];
+}
+
+function nextLadderRound(rounds,players,mode,matchLimit,courtLabels){
+  if(players.length<minPlayersFor(mode)||!rounds.length)return[];
+  const prev=rounds[rounds.length-1]||[];
+  const history=historyFromRounds(rounds,players);
+  const{units,teamSize}=scheduleUnits(players,mode,rounds);
+  const perCourt=teamSize*2; // players on a court
+  const total=units.reduce((s,u)=>s+u.members.length,0);
+  const courts=Math.min(Math.floor(total/perCourt),matchLimit??Infinity);
+  if(courts<1)return[];
+
+  // Where everyone played last round, and the last court each player was ever on.
+  const lastPos={},lastCourtEver={};
+  rounds.forEach(r=>(r||[]).forEach((m,i)=>[m.team1,m.team2].forEach(t=>{if(Array.isArray(t))t.filter(Boolean).forEach(p=>{lastCourtEver[p.id]=i;});})));
+  prev.forEach((m,i)=>{
+    const w=matchWinner(m);
+    [["team1",m.team1],["team2",m.team2]].forEach(([side,t])=>{if(Array.isArray(t))t.filter(Boolean).forEach(p=>{lastPos[p.id]={court:i,won:w===side};});});
+  });
+  const prevCourts=Math.max(1,prev.length);
+  // Sort key: target court, then winners ahead of returners ahead of losers on that court.
+  const target=u=>{
+    const lp=lastPos[u.members[0].id];
+    if(lp)return lp.won?{c:Math.max(0,lp.court-1),o:0}:{c:Math.min(prevCourts-1,lp.court+1),o:2};
+    const lc=lastCourtEver[u.members[0].id];
+    return{c:lc!=null?lc:Infinity,o:1};
+  };
+
+  // Bench whoever has sat out the fewest times when there are more players than spots.
+  let toBench=total-courts*perCourt;
+  const benched=new Set();
+  if(toBench>0){
+    const unitSat=u=>Math.min(...u.members.map(p=>history.sat[p.id]||0));
+    for(const u of shuffle(units).sort((a,b)=>unitSat(a)-unitSat(b))){
+      if(toBench<=0)break;
+      if(u.members.length<=toBench){benched.add(u);toBench-=u.members.length;}
+    }
+  }
+  const queue=units.filter(u=>!benched.has(u)).map(u=>({u,...target(u),r:Math.random()}))
+    .sort((a,b)=>a.c-b.c||a.o-b.o||a.r-b.r).map(x=>x.u);
+
+  // Fill courts top-down in ladder order.
+  const courtUnits=[];let cur=[],curSize=0;
+  while(queue.length&&courtUnits.length<courts){
+    const room=perCourt-curSize;
+    const idx=queue.findIndex(u=>u.members.length<=room);
+    if(idx===-1)break;
+    const u=queue.splice(idx,1)[0];cur.push(u);curSize+=u.members.length;
+    if(curSize===perCourt){courtUnits.push(cur);cur=[];curSize=0;}
+  }
+
+  const partnered=(a,b)=>history.partnered[pairKey(a.id,b.id)]||0;
+  const opposed=(t1,t2)=>t1.reduce((s,a)=>s+t2.reduce((s2,b)=>s2+(history.opposed[pairKey(a.id,b.id)]||0),0),0);
+  const matches=courtUnits.map(cu=>{
+    let t1,t2;
+    if(teamSize===1){t1=cu[0].members;t2=cu[1].members;}
+    else{
+      const whole=cu.find(u=>u.members.length===2);
+      if(whole){t1=whole.members;t2=cu.filter(u=>u!==whole).flatMap(u=>u.members);}
+      else{
+        // Four loose players: pick the split with the fewest repeat partners (then opponents).
+        const[a,b,c,d]=cu.map(u=>u.members[0]);
+        const options=shuffle([[[a,b],[c,d]],[[a,c],[b,d]],[[a,d],[b,c]]]);
+        const cost=([x,y])=>(partnered(x[0],x[1])+partnered(y[0],y[1]))*100+opposed(x,y);
+        [t1,t2]=options.reduce((best,o)=>cost(o)<cost(best)?o:best,options[0]);
+      }
+    }
+    return{team1:t1,team2:t2,score1:"",score2:""};
+  });
+  return labelLadderCourts(matches,courtLabels);
+}
+
 // Pool units are whole teams in fixed mode and individual players otherwise. When a schedule
 // is already running, the fixed teams come back from it so appended rounds keep them intact.
 function poolScheduleUnits(poolUnitList,mode,existingRounds){
@@ -500,6 +588,7 @@ function RRTeamBlock({team,side,isWinner,hasWinner,rrEditingName,setRrEditingNam
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 const TABS_NORMAL=["Players","All Play","Standings","Playoffs"];
+const TABS_LADDER=["Players","Ladder","Standings","Playoffs"];
 const TABS_POOL=["Players","Pool Setup","Pool Play","Pool Standings","Playoffs"];
 
 export default function FrogTournament(){
@@ -519,6 +608,11 @@ export default function FrogTournament(){
   const [rrMode,setRrMode]=useState(saved?.rrMode??"rotating");
   const [rrNumRounds,setRrNumRounds]=useState(saved?.rrNumRounds??3);
   const [rrRounds,setRrRounds]=useState(saved?.rrRounds??[]);
+  // Ladder format: winners move up a court, losers move down; one round at a time.
+  const [ladder,setLadder]=useState(saved?.ladder??false);
+  const [ladderUnlimited,setLadderUnlimited]=useState(saved?.ladderUnlimited??true);
+  // How many top-ranked entries (by record) go to the playoffs; 0 = everyone.
+  const [playoffAdvanceCount,setPlayoffAdvanceCount]=useState(saved?.playoffAdvanceCount??0);
   const [nextId,setNextId]=useState(saved?.nextId??1);
 
   // Playoff bracket state — supports multiple named brackets (e.g. "Playoff A" / "Playoff B")
@@ -572,16 +666,16 @@ export default function FrogTournament(){
   const readOnly=joined&&!canEditJoined;
 
   function currentStateSnapshot(){
-    return{players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels};
+    return{players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,ladder,ladderUnlimited,playoffAdvanceCount};
   }
 
   // Persist (skipped in read-only viewer mode — that browser is just watching someone
   // else's tournament, it shouldn't overwrite whatever local tournament it had, if any)
   useEffect(()=>{
     if(joined)return;
-    try{localStorage.setItem(STORAGE_KEY,JSON.stringify({players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,liveCode}));}
+    try{localStorage.setItem(STORAGE_KEY,JSON.stringify({players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,ladder,ladderUnlimited,playoffAdvanceCount,liveCode}));}
     catch(e){}
-  },[joined,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,liveCode]);
+  },[joined,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,ladder,ladderUnlimited,playoffAdvanceCount,liveCode]);
 
   // Tracks the JSON this browser itself last wrote to Firestore, so the subscription below
   // can tell "the server confirming my own edit" apart from "someone else's edit arrived" —
@@ -620,7 +714,7 @@ export default function FrogTournament(){
     },600);
     return()=>clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[joined,liveCode,liveEditable,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels]);
+  },[joined,liveCode,liveEditable,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,ladder,ladderUnlimited,playoffAdvanceCount]);
 
   // Live editing (joined session): once the host has turned editing on for this share link,
   // push this browser's changes back to the same shared doc too (debounced), same as the host.
@@ -637,7 +731,7 @@ export default function FrogTournament(){
     },600);
     return()=>clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[canEditJoined,viewCode,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels]);
+  },[canEditJoined,viewCode,players,rrMode,rrNumRounds,rrRounds,numPlayoffBrackets,bracketAssignmentOverrides,playoffBrackets,nextBracketId,nextId,poolPlay,numPools,poolAssignments,poolRounds,advanceCount,playoffPairingMode,poolQualifierOverrides,courtsEnabled,numCourts,customCourtLabels,ladder,ladderUnlimited,playoffAdvanceCount]);
 
   function goLive(){
     setLiveCode(prev=>prev||makeLiveCode());
@@ -714,6 +808,9 @@ export default function FrogTournament(){
     setCourtsEnabled(s.courtsEnabled??false);
     setNumCourts(s.numCourts??4);
     setCustomCourtLabels(s.customCourtLabels??"");
+    setLadder(s.ladder??false);
+    setLadderUnlimited(s.ladderUnlimited??true);
+    setPlayoffAdvanceCount(s.playoffAdvanceCount??0);
     if(resetNav){setActiveBracketIdx(0);setConfiguringPlayoffs(false);setTab(0);}
   }
 
@@ -733,6 +830,7 @@ export default function FrogTournament(){
   }
 
   const [confirmingClear, setConfirmingClear] = useState(false);
+  const [confirmingLadderRestart,setConfirmingLadderRestart]=useState(false);
 
   function clearAll(){
     setPlayers([]);setRrMode("rotating");setRrNumRounds(3);setRrRounds([]);
@@ -743,6 +841,7 @@ export default function FrogTournament(){
     setPoolQualifierOverrides({});setTab(0);setConfirmingClear(false);
     setFirstRoundByeIds([]);
     setCourtsEnabled(false);setNumCourts(4);setCustomCourtLabels("");
+    setLadder(false);setLadderUnlimited(true);setPlayoffAdvanceCount(0);
     try{localStorage.removeItem(STORAGE_KEY);}catch(e){}
   }
 
@@ -833,6 +932,16 @@ export default function FrogTournament(){
   // whom and who has sat out most from the rounds already on screen, so it keeps giving people
   // fresh partners and evens out the sit-outs rather than starting over.
   function addRound(){
+    if(ladder&&!poolPlay){
+      const last=rrRounds[rrRounds.length-1];
+      if(!roundComplete(last)){setToast(`Finish every game in Round ${rrRounds.length} first (ties don't count)`);return;}
+      const next=nextLadderRound(rrRounds,players,rrMode,courtMatchLimit,courtLabels);
+      if(!next.length){setToast(`Need at least ${minPlayers} players for another round`);return;}
+      setRrRounds(prev=>[...prev,next]);
+      if(!ladderUnlimited&&rrRounds.length+1>rrNumRounds)setRrNumRounds(rrRounds.length+1);
+      setToast(`Round ${rrRounds.length+1} generated`);
+      return;
+    }
     if(poolPlay){
       const nextByPool={};
       for(let p=0;p<numPools;p++){
@@ -862,7 +971,9 @@ export default function FrogTournament(){
   // ─── Non-pool RR
   function generateRR(){
     const byeIds=firstRoundByeInfo.needed>0&&firstRoundByeIds.length>0?firstRoundByeIds:null;
-    const rounds=generateRoundRobinRounds(players,rrMode,rrNumRounds,byeIds,courtMatchLimit);
+    // A ladder only ever builds its first round up front; each later one depends on results.
+    const rounds=ladder?generateLadderFirstRound(players,rrMode,byeIds,courtMatchLimit,courtLabels)
+      :generateRoundRobinRounds(players,rrMode,rrNumRounds,byeIds,courtMatchLimit);
     setRrRounds(rounds);
     setTab(1);
   }
@@ -905,7 +1016,7 @@ export default function FrogTournament(){
         }
         return teams.map(t=>({key:t.players.map(p=>p.id).sort((a,b)=>a-b).join("-"),name:t.players.map(p=>p.name).join(" & "),raw:t}));
       }
-      return qualifiers.map(q=>({key:String(q.entry.id),name:q.entry.name,raw:q.entry}));
+      return qualifiers.map(q=>({key:String(q.entry.id),name:q.entry.name,raw:q.entry,rank:q.rank}));
     }
     if(rrMode==="fixed"){
       return computePairStandings(rrRounds).map(t=>({key:t.players.map(p=>p.id).sort((a,b)=>a-b).join("-"),name:t.players.map(p=>p.name).join(" & "),raw:t}));
@@ -917,15 +1028,20 @@ export default function FrogTournament(){
   // (top players.length/N to bracket 1, next chunk to bracket 2, …), overridable per entry.
   // overrides[key] === -1 means "excluded from playoffs entirely" (left on the bench,
   // available later as a swap-in); anything else unset falls back to an even block split.
-  function splitEntriesIntoBrackets(entries,numBrackets,overrides){
+  // advanceLimit (>0) keeps only the top N entries by record unless one is placed by hand.
+  function splitEntriesIntoBrackets(entries,numBrackets,overrides,advanceLimit=playoffAdvanceCount){
     const perBracket=Array.from({length:numBrackets},()=>[]);
-    const size=Math.max(1,Math.ceil(entries.length/numBrackets));
-    entries.forEach((e,i)=>{
+    const limit=advanceLimit>0?advanceLimit:Infinity;
+    const placed=ov=>ov!=null&&ov>=0&&ov<numBrackets;
+    // With pool play, "top N" takes each pool's #1s first, then #2s, and so on.
+    const top=new Set(entries.map((e,i)=>({e,i,k:e.rank??i})).sort((a,b)=>a.k-b.k||a.i-b.i).slice(0,limit).map(x=>x.e));
+    const auto=entries.filter(e=>overrides[e.key]!==-1&&!placed(overrides[e.key])&&top.has(e));
+    const size=Math.max(1,Math.ceil(auto.length/numBrackets));
+    entries.forEach(e=>{
       const ov=overrides[e.key];
-      if(ov===-1)return;
-      let b=ov;
-      if(b==null||b<0||b>=numBrackets)b=Math.min(numBrackets-1,Math.floor(i/size));
-      perBracket[b].push(e);
+      if(placed(ov)){perBracket[ov].push(e);return;}
+      const ai=auto.indexOf(e);
+      if(ai!==-1)perBracket[Math.min(numBrackets-1,Math.floor(ai/size))].push(e);
     });
     return perBracket;
   }
@@ -1015,7 +1131,34 @@ export default function FrogTournament(){
   }
 
   function updateRRScore(rIdx,mIdx,field,val){
-    setRrRounds(prev=>prev.map((r,ri)=>ri!==rIdx?r:r.map((m,mi)=>mi!==mIdx?m:{...m,[field]:val})));
+    const oldMatch=rrRounds[rIdx]?.[mIdx];
+    if(oldMatch&&String(oldMatch[field]??"")===String(val??""))return; // blur without a change
+    const updated=rrRounds.map((r,ri)=>ri!==rIdx?r:r.map((m,mi)=>mi!==mIdx?m:{...m,[field]:val}));
+    setRrRounds(ladder&&!poolPlay&&(field==="score1"||field==="score2")?ladderAfterScoreEdit(rrRounds,updated,rIdx,mIdx):updated);
+  }
+
+  // Ladder: the round after a finished round is generated the moment its last score goes in.
+  // If a score in the previous round is corrected while the newest round hasn't started (no
+  // scores yet), the newest round is rebuilt from the corrected results — or withdrawn, if
+  // the correction leaves that previous round unfinished.
+  function ladderAfterScoreEdit(before,after,rIdx,mIdx){
+    const last=after.length-1;
+    if(rIdx===last){
+      const capReached=!ladderUnlimited&&after.length>=rrNumRounds;
+      if(!roundComplete(before[rIdx])&&roundComplete(after[rIdx])&&!capReached){
+        const next=nextLadderRound(after,players,rrMode,courtMatchLimit,courtLabels);
+        if(next.length){setToast(`Round ${after.length} complete — Round ${after.length+1} is up`);return[...after,next];}
+      }
+      return after;
+    }
+    if(rIdx===last-1&&!roundHasScores(after[last])){
+      if(!roundComplete(after[rIdx])){setToast(`Round ${last+1} withdrawn until Round ${rIdx+1} is finished`);return after.slice(0,last);}
+      if(matchWinner(before[rIdx][mIdx])!==matchWinner(after[rIdx][mIdx])){
+        const next=nextLadderRound(after.slice(0,last),players,rrMode,courtMatchLimit,courtLabels);
+        if(next.length){setToast(`Round ${last+1} updated for the corrected score`);return[...after.slice(0,last),next];}
+      }
+    }
+    return after;
   }
 
   function updatePoolScore(poolIdx,rIdx,mIdx,field,val){
@@ -1042,7 +1185,17 @@ export default function FrogTournament(){
     // Someone joining mid-tournament gets worked into the rounds that haven't been played yet;
     // anything already scored stays exactly as it was. The replacements continue the existing
     // rotation rather than starting it over, so nobody gets handed a partner they've had.
-    if(rrRounds.length>0&&!poolPlay){
+    if(ladder&&!poolPlay&&rrRounds.length>0){
+      // Ladder: slot the newcomer into the upcoming round if it hasn't started yet;
+      // otherwise they join (at the bottom court) when the next round is generated.
+      const updatedPlayers=[...players,p];
+      const last=rrRounds.length-1;
+      if(!roundHasScores(rrRounds[last])){
+        const rebuilt=last===0?generateLadderFirstRound(updatedPlayers,rrMode,null,courtMatchLimit,courtLabels)[0]
+          :nextLadderRound(rrRounds.slice(0,last),updatedPlayers,rrMode,courtMatchLimit,courtLabels);
+        if(rebuilt&&rebuilt.length)setRrRounds([...rrRounds.slice(0,last),rebuilt]);
+      }
+    } else if(rrRounds.length>0&&!poolPlay){
       const updatedPlayers=[...players,p];
       const firstUnscored=rrRounds.findIndex(r=>r.every(m=>m.score1===""&&m.score2===""));
       if(firstUnscored!==-1){
@@ -1140,7 +1293,8 @@ export default function FrogTournament(){
   const standings=useMemo(()=>rrMode==="fixed"?computePairStandings(rrRounds):computeStandings(players,rrRounds),[players,rrRounds,rrMode]);
   const minPlayers=minPlayersFor(rrMode);
   const pinnedPairs=useMemo(()=>extractPinnedPairs(players).pinnedPairs,[players]);
-  const TABS=poolPlay?TABS_POOL:TABS_NORMAL;
+  const isLadder=ladder&&!poolPlay;
+  const TABS=poolPlay?TABS_POOL:isLadder?TABS_LADDER:TABS_NORMAL;
 
   // ─── Styles ───────────────────────────────────────────────────────────────
   const S={
@@ -1436,6 +1590,7 @@ export default function FrogTournament(){
           <div style={{...S.card,padding:0,overflow:"hidden"}}>
             <div style={S.roundHeader}>
               <span>⚡ Round {rIdx+1}</span>
+              {isLadder&&poolIdx===null&&<span style={{...S.badge(roundComplete(round)?C.lime:"rgba(255,255,255,0.18)",roundComplete(round)?C.greenDark:C.white),fontSize:11}}>{roundComplete(round)?"✓ Complete":"In progress"}</span>}
               <span style={{marginLeft:"auto",fontSize:12,opacity:0.8}}>{round.length} match{round.length!==1?"es":""}</span>
             </div>
             <div style={{padding:14}}>
@@ -1443,7 +1598,11 @@ export default function FrogTournament(){
                 const w=matchWinner(match);
                 return(
                   <div key={mIdx}>
-                    {courtsEnabled&&courtLabels.length>0&&(
+                    {isLadder&&poolIdx===null?(
+                      <div style={{marginBottom:4,display:"flex",gap:6,alignItems:"center"}}>
+                        <span style={{...S.badge(mIdx===0?C.amber:C.grayLight,mIdx===0?C.white:C.greenDark),fontSize:11}}>🪜 Court {match.court??mIdx+1}{mIdx===0?" · Top":mIdx===round.length-1&&round.length>1?" · Bottom":""}</span>
+                      </div>
+                    ):courtsEnabled&&courtLabels.length>0&&(
                       <div style={{marginBottom:4}}>
                         {readOnly?(
                           <span style={{...S.badge(C.grayLight,C.greenDark),fontSize:11}}>🎾 Court {match.court??courtLabels[mIdx%courtLabels.length]}</span>
@@ -1466,9 +1625,9 @@ export default function FrogTournament(){
                           </>
                         ):(
                           <>
-                            <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s1`} defaultValue={match.score1} onBlur={e=>updateScore(rIdx,mIdx,"score1",e.target.value)} placeholder="—"/>
+                            <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s1-${match.score1}`} defaultValue={match.score1} onBlur={e=>updateScore(rIdx,mIdx,"score1",e.target.value)} placeholder="—"/>
                             <span style={{fontWeight:900,color:C.gray,fontSize:16}}>vs</span>
-                            <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s2`} defaultValue={match.score2} onBlur={e=>updateScore(rIdx,mIdx,"score2",e.target.value)} placeholder="—"/>
+                            <input type="number" min="0" style={S.scoreInput} key={`r${rIdx}m${mIdx}s2-${match.score2}`} defaultValue={match.score2} onBlur={e=>updateScore(rIdx,mIdx,"score2",e.target.value)} placeholder="—"/>
                           </>
                         )}
                       </div>
@@ -1514,7 +1673,7 @@ export default function FrogTournament(){
           <span style={{...S.badge(C.greenMid),fontSize:13}}>{players.length} Players</span>
           {poolPlay&&<span style={{...S.badge(C.blue),fontSize:13}}>{numPools} Pools</span>}
           {pinnedPairs.length>0&&<span style={{...S.badge(C.amber),fontSize:13}}>{pinnedPairs.length} Pairs</span>}
-          {!poolPlay&&rrRounds.length>0&&<span style={{...S.badge(C.blue),fontSize:13}}>{rrRounds.length} Games/Player</span>}
+          {!poolPlay&&rrRounds.length>0&&<span style={{...S.badge(C.blue),fontSize:13}}>{ladder?`🪜 Round ${rrRounds.length}`:`${rrRounds.length} Games/Player`}</span>}
           {playoffBrackets.length>0&&<span style={{...S.badge(C.green),fontSize:13}}>{playoffBrackets.length} Playoff Bracket{playoffBrackets.length!==1?"s":""}</span>}
           {joined?(
             canEditJoined?(
@@ -1633,9 +1792,11 @@ export default function FrogTournament(){
               <div style={{marginBottom:16}}>
                 <div style={{fontSize:13,fontWeight:700,color:C.greenDark,marginBottom:6}}>Tournament Format</div>
                 <div style={{display:"flex",borderRadius:8,overflow:"hidden",border:`1.5px solid ${C.grayLight}`,width:"fit-content"}}>
-                  <button style={S.modeBtn(!poolPlay)} onClick={()=>{setPoolPlay(false);setTab(0);}}>🏃 All Play</button>
-                  <button style={S.modeBtn(poolPlay)} onClick={()=>{setPoolPlay(true);setTab(0);}}>🏊 Pool Play</button>
+                  <button style={S.modeBtn(!poolPlay&&!ladder)} onClick={()=>{setPoolPlay(false);setLadder(false);setTab(0);}}>🏃 All Play</button>
+                  <button style={S.modeBtn(poolPlay)} onClick={()=>{setPoolPlay(true);setLadder(false);setTab(0);}}>🏊 Pool Play</button>
+                  <button style={S.modeBtn(!poolPlay&&ladder)} onClick={()=>{setPoolPlay(false);setLadder(true);setTab(0);}}>🪜 Ladder</button>
                 </div>
+                {isLadder&&<div style={{fontSize:12,color:C.gray,marginTop:4}}>Winners move up a court, losers move down. Each round starts when every game in the last one is finished. Court 1 is the top court.</div>}
               </div>
 
               {/* Match type */}
@@ -1713,11 +1874,28 @@ export default function FrogTournament(){
                 )}
               </div>
 
-              {/* Games per player */}
+              {/* Games per player (ladder: number of rounds, or keep going) */}
+              {isLadder?(
+                <div style={{marginBottom:16,padding:"14px 16px",borderRadius:10,background:C.cream,border:`1.5px solid ${C.grayLight}`}}>
+                  <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontWeight:800,fontSize:13,color:C.greenDark,marginBottom:ladderUnlimited?0:10}}>
+                    <input type="checkbox" checked={ladderUnlimited} onChange={e=>setLadderUnlimited(e.target.checked)}/>
+                    🔁 Keep generating rounds (no set number)
+                  </label>
+                  {ladderUnlimited?(
+                    <div style={{fontSize:12,color:C.gray,marginTop:4}}>A new round is generated each time a round finishes, until you move on to playoffs.</div>
+                  ):(
+                    <>
+                      <NumSelect value={rrNumRounds} onChange={setRrNumRounds} label="Number of rounds:"/>
+                      <div style={{fontSize:12,color:C.gray,marginTop:4}}>The ladder stops after Round {rrNumRounds}. You can still add a round by hand.</div>
+                    </>
+                  )}
+                </div>
+              ):(
               <div style={{marginBottom:16}}>
                 <NumSelect value={rrNumRounds} onChange={setRrNumRounds} label="Games per player:"/>
                 <div style={{fontSize:12,color:C.gray,marginTop:4}}>Each player plays {rrNumRounds} game{rrNumRounds!==1?"s":""}</div>
               </div>
+              )}
 
               {/* Pool play settings */}
               {poolPlay&&(
@@ -1784,7 +1962,7 @@ export default function FrogTournament(){
                 </button>
               ):(
                 <button style={S.bigBtn("blue")} onClick={generateRR} disabled={players.length<minPlayers}>
-                  🎲 Generate {rrMode==="singles"?"Singles":"All Play"} Schedule
+                  {isLadder?"🪜 Start Ladder":`🎲 Generate ${rrMode==="singles"?"Singles":"All Play"} Schedule`}
                 </button>
               )}
               {players.length<minPlayers&&<span style={{color:C.limeLight,fontSize:13,alignSelf:"center"}}>Need at least {minPlayers} players</span>}
@@ -1896,8 +2074,20 @@ export default function FrogTournament(){
               ):(
                 <>
                   {!readOnly&&<div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
-                    <button style={S.bigBtn("lime")} onClick={generateRR}>🔀 Re-randomize</button>
-                    <button style={S.bigBtn("dark")} onClick={addRound} title="Add another round, keeping the rounds already played">➕ Add Round</button>
+                    {isLadder?(
+                      confirmingLadderRestart?(
+                        <span style={{display:"flex",gap:8,alignItems:"center"}}>
+                          <span style={{color:C.white,fontWeight:700,fontSize:13}}>Restart and erase all ladder scores?</span>
+                          <button style={S.smallBtn("red")} onClick={()=>{setConfirmingLadderRestart(false);generateRR();}}>Yes, restart</button>
+                          <button style={S.smallBtn("ghost")} onClick={()=>setConfirmingLadderRestart(false)}>Cancel</button>
+                        </span>
+                      ):(
+                        <button style={S.bigBtn("lime")} onClick={()=>setConfirmingLadderRestart(true)}>🔀 Restart Ladder</button>
+                      )
+                    ):(
+                      <button style={S.bigBtn("lime")} onClick={generateRR}>🔀 Re-randomize</button>
+                    )}
+                    <button style={S.bigBtn("dark")} onClick={addRound} title={isLadder?"Generate the next ladder round from the last round's results":"Add another round, keeping the rounds already played"}>{isLadder?"⏭ Next Round":"➕ Add Round"}</button>
                     <button style={S.bigBtn("blue")} onClick={()=>{setConfiguringPlayoffs(true);setTab(playoffsTabIdx);}}>🏆 Set Up Playoffs →</button>
                     {addingPlayer?(
                       <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -1909,6 +2099,22 @@ export default function FrogTournament(){
                       <button style={S.smallBtn("lime")} onClick={()=>setAddingPlayer(true)}>+ Add Player</button>
                     )}
                   </div>}
+                  {isLadder&&(()=>{
+                    const last=rrRounds[rrRounds.length-1]||[];
+                    const done=last.filter(m=>matchWinner(m)!==null).length;
+                    const finished=!ladderUnlimited&&rrRounds.length>=rrNumRounds&&roundComplete(last);
+                    return(
+                      <div style={{...S.card,padding:"14px 18px",marginBottom:16,borderLeft:`5px solid ${finished?C.green:C.blue}`}}>
+                        <div style={{fontWeight:800,color:C.greenDark,fontSize:15}}>
+                          {finished?`🏁 Ladder finished after ${rrRounds.length} round${rrRounds.length!==1?"s":""}`:`🪜 Round ${rrRounds.length}${ladderUnlimited?"":` of ${rrNumRounds}`} in progress · ${done} of ${last.length} games finished`}
+                        </div>
+                        <div style={{fontSize:12,color:C.gray,marginTop:4}}>
+                          {finished?"Head to Standings or set up playoffs. You can still add a round with Next Round."
+                            :"The next round is generated automatically once every game has a score (ties don't count). Winners move up a court, losers move down."}
+                        </div>
+                      </div>
+                    );
+                  })()}
                   <RoundsList rounds={rrRounds} updateScore={updateRRScore}/>
                 </>
               )
@@ -1994,6 +2200,20 @@ export default function FrogTournament(){
                   <div style={{display:"flex",gap:16,flexWrap:"wrap",alignItems:"center",marginBottom:16}}>
                     <NumSelect value={numPlayoffBrackets} onChange={setNumPlayoffBrackets} label="Number of playoff brackets:"/>
                     <button style={S.smallBtn("ghost")} onClick={()=>setBracketAssignmentOverrides({})}>🎲 Reset to auto-split</button>
+                  </div>
+
+                  <div style={{marginBottom:16}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                      <span style={{fontWeight:700,fontSize:13,color:C.greenDark}}>{rrMode==="fixed"?"Teams":"Players"} advancing to playoffs:</span>
+                      <select style={S.numSelect} value={playoffAdvanceCount>0&&playoffAdvanceCount<=entryPool.length?playoffAdvanceCount:0} onChange={e=>setPlayoffAdvanceCount(Number(e.target.value))}>
+                        <option value={0}>All ({entryPool.length})</option>
+                        {Array.from({length:Math.max(0,entryPool.length-2)},(_,i)=>i+2).map(n=><option key={n} value={n}>Top {n}</option>)}
+                      </select>
+                    </div>
+                    <div style={{fontSize:12,color:C.gray,marginTop:4}}>
+                      Seeded by record: win %, then average point differential per game (see Standings).
+                      {rrMode==="rotating"&&playoffAdvanceCount>0&&playoffAdvanceCount%2===1&&" Players are paired into doubles teams, so with an odd number the last one sits out."}
+                    </div>
                   </div>
 
                   {rrMode==="rotating"&&(
